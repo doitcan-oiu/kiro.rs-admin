@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { toast } from 'sonner'
+import { useQuery } from '@tanstack/react-query'
 import {
   Dialog,
   DialogContent,
@@ -10,7 +11,8 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { useUpdateCredential } from '@/hooks/use-credentials'
-import { extractErrorMessage } from '@/lib/utils'
+import { getProxyPool } from '@/api/credentials'
+import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
 import type { CredentialStatusItem } from '@/types/api'
 
 interface EditCredentialDialogProps {
@@ -28,6 +30,13 @@ export function EditCredentialDialog({
   const [proxyUrl, setProxyUrl] = useState(credential.proxyUrl ?? '')
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
+  const [manualMode, setManualMode] = useState(false)
+
+  const { data: proxyPool } = useQuery({
+    queryKey: ['proxy-pool'],
+    queryFn: getProxyPool,
+    enabled: open,
+  })
 
   // 每次打开时重置表单为当前凭据值
   useEffect(() => {
@@ -36,6 +45,7 @@ export function EditCredentialDialog({
       setProxyUrl(credential.proxyUrl ?? '')
       setProxyUsername('')
       setProxyPassword('')
+      setManualMode(false)
     }
   }, [open, credential])
 
@@ -65,6 +75,17 @@ export function EditCredentialDialog({
       }
     )
   }
+
+  const enabledProxies = proxyPool?.proxies.filter(p => p.enabled) ?? []
+
+  // 当前 proxyUrl 是否是自定义值（不匹配任何标准选项）
+  const isCustomUrl = proxyUrl !== '' && proxyUrl !== 'direct' &&
+    !enabledProxies.some(p => p.url === proxyUrl)
+
+  // 显示手动输入框：明确进入手动模式，或当前值就是自定义值
+  const showManualInput = manualMode || isCustomUrl
+
+  const selectValue = showManualInput ? '__custom__' : proxyUrl
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -98,13 +119,49 @@ export function EditCredentialDialog({
             {/* 代理配置 */}
             <div className="space-y-2">
               <label className="text-sm font-medium">代理配置</label>
-              <Input
-                id="proxyUrl"
-                placeholder='代理 URL（留空使用全局配置，"direct" 不使用代理）'
-                value={proxyUrl}
-                onChange={(e) => setProxyUrl(e.target.value)}
+
+              {/* 下拉选择代理 */}
+              <select
+                value={selectValue}
+                onChange={(e) => {
+                  const val = e.target.value
+                  if (val === '__custom__') {
+                    setManualMode(true)
+                    // 保留当前 proxyUrl 作为初始值让用户编辑
+                  } else {
+                    setManualMode(false)
+                    setProxyUrl(val)
+                  }
+                }}
                 disabled={isPending}
-              />
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <option value="">使用全局代理配置</option>
+                <option value="direct">直连（不使用代理）</option>
+                {enabledProxies.length > 0 && (
+                  <optgroup label="代理池">
+                    {enabledProxies.map(p => (
+                      <option key={p.id} value={p.url}>
+                        {p.label ? `${p.label} | ${maskProxyUrl(p.url)}` : maskProxyUrl(p.url)}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+                <option value="__custom__">手动输入...</option>
+              </select>
+
+              {/* 自定义 URL 手动输入框 */}
+              {showManualInput && (
+                <Input
+                  placeholder='自定义代理 URL（如 socks5://user:pass@host:port）'
+                  value={proxyUrl}
+                  onChange={(e) => setProxyUrl(e.target.value)}
+                  disabled={isPending}
+                  className="font-mono text-sm"
+                />
+              )}
+
+              {/* 代理认证（仅在需要时显示） */}
               <div className="grid grid-cols-2 gap-2">
                 <Input
                   id="proxyUsername"
@@ -123,7 +180,7 @@ export function EditCredentialDialog({
                 />
               </div>
               <p className="text-xs text-muted-foreground">
-                代理 URL 留空使用全局代理；输入 "direct" 显式不使用代理
+                用户名/密码留空表示不修改；代理 URL 已包含凭据时无需填写
               </p>
             </div>
           </div>
