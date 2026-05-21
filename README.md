@@ -490,23 +490,23 @@ volumes:
 
 ## 发布流程
 
-正式发布使用 GitHub Actions 的 **Release** workflow：
+正式发布使用 `v*` git tag 触发 GitHub Actions 的 **Release** workflow：
 
-1. 修改 `Cargo.toml` 中的 `package.version`，例如 `2026.3.2`。
-2. 合并到 `master` 后，在 GitHub Actions 页面手动运行 `Release`。
-3. 输入同一个版本号（可写 `2026.3.2` 或 `v2026.3.2`）。
+1. 修改 `Cargo.toml` 中的 `package.version`，例如 `0.1.0`。
+2. 合并到 `master` 后，创建并推送同版本 tag，例如 `v0.1.0`。
+
+也可以在 GitHub Actions 页面手动运行 `Release`，输入同一个版本号（可写 `0.1.0` 或 `v0.1.0`）。
 
 该 workflow 会自动完成：
 
-- 校验输入版本和 `Cargo.toml` 一致，避免 tag、二进制和镜像版本错位
+- 校验 tag/input 版本和 `Cargo.toml` 一致，避免 tag、二进制和镜像版本错位
 - 构建 Windows、Linux、macOS 多平台二进制并打包
 - 发布 GHCR 多架构镜像：
   - `ghcr.io/zyphrzero/kiro-rs:<version>`
   - `ghcr.io/zyphrzero/kiro-rs:latest`
-- 创建 `v<version>` git tag
 - 创建 GitHub Release，并上传二进制包和 `SHA256SUMS.txt`
 
-`Build Artifacts` 和 `Build and Push GHCR Images` workflow 仍会在 `master` push 上生成 beta 构建，也可以手动输入版本号运行；正式发布入口以 `Release` workflow 为准，避免 tag 发布时重复构建和重复推送镜像。`master` 的 beta 镜像只更新 `beta` 标签，不会覆盖 `latest`。
+`Build Artifacts` 和 `Build and Push GHCR Images` workflow 仍会在 `master` push 上生成 beta 构建，也可以手动输入版本号运行；正式发布入口以 `Release` workflow 为准，避免重复构建和重复推送镜像。`master` 的 beta 镜像只更新 `beta` 标签，不会覆盖 `latest`。
 
 ## 注意事项
 
