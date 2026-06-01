@@ -6,6 +6,33 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.8] - 2026-06-01
+
+主题：IP 代理池从「仅能增删改查 + 手动分配」升级为**具备主动健康检查、失败累计自动剔除、轮询批量分配**的完整代理管理能力。此前加完代理只能等真实请求才知道是否可用，代理失效也不会被记录或自动禁用，且只能逐个手动分配给凭据。
+
+### ✨ 新功能 — 主动健康检查与连通性测试
+
+- **探测连通性与延迟**：`ProxyEntry` 新增 `health / latencyMs / lastCheckedAt / consecutiveFailures / autoDisabled` 字段（`serde(default)` 向后兼容旧 `proxy_pool.json`）。通过该代理请求轻量公网端点 `https://www.gstatic.com/generate_204`（8s 超时）验证「能否走通 + 往返延迟」，不依赖上游 Kiro。
+- **后台健康检查调度器**：照搬 `start_balance_refresher` 模式新增 `start_proxy_health_checker`，每 5 分钟对所有已启用代理用 `join_all` 并发探测一次。
+- **新接口 `POST /proxy-pool/{id}/check` 与 `/proxy-pool/check-all`**：分别供 UI「测试」按钮即时探测单个代理、以及手动触发全量健康检查。
+
+### ✨ 新功能 — 失败累计与自动剔除
+
+- **连续探测失败自动禁用**：探测失败累计 `consecutive_failures`，达阈值（3 次，与凭据 `MAX_FAILURES_PER_CREDENTIAL` 对齐）即自动 `enabled=false, auto_disabled=true`；探测成功立即清零。用户手动重新启用时清除自动禁用标记与失败计数。仅由健康检查触发，不侵入 `provider.rs` 请求热路径。
+
+### ✨ 新功能 — 轮询批量分配
+
+- **新接口 `POST /proxy-pool/assign-round-robin`**：取「已启用且非 Unhealthy」的可用代理，对目标凭据（默认全部）按取模轮询写入 `proxy_url`，复用 `token_manager.update_credential`，免去逐个手动分配。
+
+### ⚡ 优化 — HTTP Client 缓存
+
+- **缓存容量上限淘汰**：`provider.rs` 的 `client_cache` 原为无界 `HashMap`，代理数增长会令每个代理常驻一个 `reqwest::Client` 导致内存无界增长。改为带容量上限（64）的 `ClientCache`，按插入顺序淘汰最旧的非全局代理 client，全局代理 client 常驻不被淘汰。
+
+### 🎨 前端
+
+- 代理池弹窗每行新增健康状态徽章（绿：可用 + 延迟 ms / 红：异常 + 连续失败次数 / 灰：未检测）与最近检测时间，并区分「自动禁用」与用户「手动禁用」。
+- 每行新增「测试」按钮，顶部新增「全部检测」「轮询分配」按钮。
+
 ## [0.5.7] - 2026-05-30
 
 主题：凭据失败次数从单一"连续失败计数器"升级为**累计统计 + 按类型三色分类展示**。此前卡片"失败次数"绑定 `failure_count`（连续失败计数器，成功即清零、账号风控与瞬态不计入），导致鉴权失败被其他凭据救回后立即清零、账号风控压根不显示，与用户对"这个凭据到底失败了多少次、什么原因"的直觉不符。
