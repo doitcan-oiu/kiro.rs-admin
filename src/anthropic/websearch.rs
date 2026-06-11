@@ -102,24 +102,31 @@ pub struct WebSearchResult {
     pub public_domain: Option<bool>,
 }
 
+fn is_native_web_search_tool(t: &crate::anthropic::types::Tool) -> bool {
+    t.name == "web_search"
+        && t.tool_type
+            .as_deref()
+            .is_some_and(|typ| typ.starts_with("web_search_"))
+}
+
 /// 检查请求是否为纯 WebSearch 请求
 ///
-/// 条件：tools 有且只有一个，且 name 为 web_search
+/// 条件：tools 有且只有一个，且为 Anthropic 原生 web_search 工具。
 pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
     req.tools.as_ref().is_some_and(|tools| {
-        tools.len() == 1 && tools.first().is_some_and(|t| t.name == "web_search")
+        tools.len() == 1 && tools.first().is_some_and(is_native_web_search_tool)
     })
 }
 
 /// Checks whether the request is a "mixed-tools set that contains web_search" case
 ///
 /// Mutually exclusive with [`has_web_search_tool`]: that one is the pure single-tool fast path, while this one detects
-/// the case where web_search coexists with other tools (exec, etc.) - such a request falls onto the normal chat path,
-/// where the upstream may return a tool_use with name=web_search, requiring the internal agentic loop.
+/// the case where native web_search coexists with other tools (exec, etc.) - such a request falls onto the normal chat
+/// path, where the upstream may return a tool_use with name=web_search, requiring the internal agentic loop.
 pub(crate) fn has_web_search_among_tools(req: &MessagesRequest) -> bool {
-    req.tools.as_ref().is_some_and(|tools| {
-        tools.len() > 1 && tools.iter().any(|t| t.name == "web_search")
-    })
+    req.tools
+        .as_ref()
+        .is_some_and(|tools| tools.len() > 1 && tools.iter().any(is_native_web_search_tool))
 }
 
 /// 从消息中提取搜索查询
@@ -630,6 +637,50 @@ mod tests {
 
         // 多个工具时不应该被识别为纯 websearch 请求
         assert!(!has_web_search_tool(&req));
+        assert!(has_web_search_among_tools(&req));
+    }
+
+    #[test]
+    fn test_regular_tool_named_web_search_does_not_trigger_native_websearch() {
+        use crate::anthropic::types::{Message, Tool};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            stream: true,
+            system: None,
+            tools: Some(vec![
+                Tool {
+                    tool_type: None,
+                    name: "web_search".to_string(),
+                    description: "Regular client-side search tool".to_string(),
+                    input_schema: Default::default(),
+                    max_uses: None,
+                    cache_control: None,
+                },
+                Tool {
+                    tool_type: None,
+                    name: "other_tool".to_string(),
+                    description: "Other tool".to_string(),
+                    input_schema: Default::default(),
+                    max_uses: None,
+                    cache_control: None,
+                },
+            ]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        // A regular client-defined tool can be named web_search, but only
+        // Anthropic's native web search tool has type=web_search_*.
+        assert!(!has_web_search_tool(&req));
+        assert!(!has_web_search_among_tools(&req));
     }
 
     #[test]
