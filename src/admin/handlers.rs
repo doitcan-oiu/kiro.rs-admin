@@ -1191,7 +1191,7 @@ pub async fn list_traces(
     // 其余客户端 Key 命中名称表则取名称、未命中则回退 #id。
     let key_label = |key_id: u64| -> String {
         if key_id == 0 {
-            "master".to_string()
+            "管理员API密钥".to_string()
         } else {
             client_key_name_map
                 .get(&key_id)

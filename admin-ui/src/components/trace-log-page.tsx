@@ -253,11 +253,7 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
           {rec.isStream && <Badge variant="outline" className="ml-1.5">流式</Badge>}
         </td>
         <td className="py-2.5 pr-3 text-[13px]">
-          {rec.keyId === 0 ? (
-            <span className="text-muted-foreground">{keyLabel(rec.keyId, rec.keyName)}</span>
-          ) : (
-            <Badge variant="outline">{keyLabel(rec.keyId, rec.keyName)}</Badge>
-          )}
+          <Badge variant="outline">{keyLabel(rec.keyId, rec.keyName)}</Badge>
         </td>
         <td className="py-2.5 pr-3">
           <StatusBadge status={rec.finalStatus} />
@@ -492,7 +488,7 @@ export function TraceLogPage() {
   const { data: keysData } = useClientKeys()
   const keyOptions = [
     { value: '', label: '全部 Key' },
-    { value: '0', label: 'master' },
+    { value: '0', label: '管理员API密钥' },
     ...(keysData?.keys ?? []).map((k) => ({ value: String(k.id), label: k.name })),
   ]
 
@@ -574,7 +570,7 @@ export function TraceLogPage() {
                     <th className="py-2 pl-3 pr-2 font-medium"></th>
                     <th className="py-2 pr-3 font-medium">时间</th>
                     <th className="py-2 pr-3 font-medium">模型</th>
-                    <th className="py-2 pr-3 font-medium">客户端 Key</th>
+                    <th className="py-2 pr-3 font-medium">入口 Key</th>
                     <th className="py-2 pr-3 font-medium">状态</th>
                     <th className="py-2 pr-3 font-medium">最终凭据</th>
                     <th className="py-2 pr-3 font-medium">Token</th>
