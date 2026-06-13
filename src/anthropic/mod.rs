@@ -36,4 +36,4 @@ mod websearch_loop;
 // 项目内默认走 `create_router_with_shared_key`，因此本身不会触发该函数。
 #[allow(unused_imports)]
 pub use router::create_router_with_provider;
-pub use router::create_router_with_shared_key;
+pub use router::create_router;

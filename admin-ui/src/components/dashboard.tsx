@@ -16,17 +16,12 @@ import {
   LogIn,
   Key,
   Building2,
-  Settings,
   UploadCloud,
   MoreHorizontal,
   Activity,
   ChevronLeft,
   ChevronRight,
   AlertTriangle,
-  Eye,
-  EyeOff,
-  Copy,
-  Wand2,
   Zap,
   Tags,
 } from "lucide-react";
@@ -49,15 +44,6 @@ import { storage } from "@/lib/storage";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Input } from "@/components/ui/input";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogFooter,
-  DialogDescription,
-} from "@/components/ui/dialog";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -116,16 +102,13 @@ import {
 import {
   getCredentialBalance,
   forceRefreshToken,
-  updateAdminKey,
   disableQuotaExceeded,
-  updateApiKey,
   enableOverageForAllCapable,
   exportKamCredentials,
 } from "@/api/credentials";
 import {
   extractErrorMessage,
   parseError,
-  generateApiKey,
   formatNumber,
   overageFailureMessage,
 } from "@/lib/utils";
@@ -148,12 +131,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false);
   const [proxyPoolDialogOpen, setProxyPoolDialogOpen] = useState(false);
   const [imageUpdateDialogOpen, setImageUpdateDialogOpen] = useState(false);
-  const [adminKeyDialogOpen, setAdminKeyDialogOpen] = useState(false);
-  const [newAdminKey, setNewAdminKey] = useState("");
-  const [updatingAdminKey, setUpdatingAdminKey] = useState(false);
-  const [showAdminKeyPlain, setShowAdminKeyPlain] = useState(false);
-  /** 当前对话框正在编辑哪个 Key：'admin' = 管理面板登录 Key；'api' = 业务 /v1 流量 Key */
-  const [keyEditMode, setKeyEditMode] = useState<"admin" | "api">("admin");
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false);
   const [verifying, setVerifying] = useState(false);
@@ -865,37 +842,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
   };
 
-  const handleUpdateAdminKey = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const key = newAdminKey.trim();
-    if (!key) {
-      toast.error(
-        keyEditMode === "admin"
-          ? "新登录API密钥不能为空"
-          : "新管理员API密钥不能为空",
-      );
-      return;
-    }
-    setUpdatingAdminKey(true);
-    try {
-      if (keyEditMode === "admin") {
-        await updateAdminKey({ newKey: key });
-        storage.setApiKey(key);
-        toast.success("登录API密钥已更新，已自动切换到新 Key");
-      } else {
-        await updateApiKey({ newKey: key });
-        toast.success(
-          "管理员API密钥已更新，所有使用 /v1 接口的客户端都需要切换",
-        );
-      }
-      setAdminKeyDialogOpen(false);
-      setNewAdminKey("");
-    } catch (error) {
-      toast.error(`更新失败: ${extractErrorMessage(error)}`);
-    } finally {
-      setUpdatingAdminKey(false);
-    }
-  };
 
   const handleToggleLoadBalancing = () => {
     const cur = loadBalancingData?.mode || "priority";
@@ -1020,38 +966,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   </span>
                 )}
               </Button>
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button variant="ghost" size="icon" title="设置">
-                    <Settings className="h-4 w-4" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end">
-                  <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
-                  <DropdownMenuItem
-                    onSelect={() => {
-                      setKeyEditMode("admin");
-                      setNewAdminKey("");
-                      setShowAdminKeyPlain(false);
-                      setAdminKeyDialogOpen(true);
-                    }}
-                  >
-                    <Key />
-                    修改登录API密钥（管理面板登录）
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    onSelect={() => {
-                      setKeyEditMode("api");
-                      setNewAdminKey("");
-                      setShowAdminKeyPlain(false);
-                      setAdminKeyDialogOpen(true);
-                    }}
-                  >
-                    <Key />
-                    修改管理员API密钥（客户端 /v1 调用）
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
               <Button
                 variant="ghost"
                 size="icon"
@@ -1587,122 +1501,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         onCancel={handleCancelVerify}
       />
 
-      {/* 修改登录API密钥对话框 */}
-      <Dialog
-        open={adminKeyDialogOpen}
-        onOpenChange={(open) => {
-          if (!updatingAdminKey) setAdminKeyDialogOpen(open);
-        }}
-      >
-        <DialogContent className="sm:max-w-sm">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <Key className="h-4 w-4" />
-              {keyEditMode === "admin"
-                ? "修改登录API密钥"
-                : "修改管理员API密钥"}
-            </DialogTitle>
-            <DialogDescription>
-              {keyEditMode === "admin"
-                ? "用于登录此管理面板。修改后将自动更新本地存储的 Key，无需重新登录。"
-                : "客户端调用 /v1/* 接口时携带的密钥。修改后所有第三方客户端（Cline、Cursor、SDK 等）都需要更新为新值。"}
-            </DialogDescription>
-          </DialogHeader>
-          <form onSubmit={handleUpdateAdminKey} className="space-y-4 py-2">
-            <div className="relative">
-              <Input
-                type={showAdminKeyPlain ? "text" : "password"}
-                placeholder={
-                  keyEditMode === "admin"
-                    ? "输入或生成新的登录API密钥"
-                    : "输入或生成新的管理员API密钥"
-                }
-                value={newAdminKey}
-                onChange={(e) => setNewAdminKey(e.target.value)}
-                disabled={updatingAdminKey}
-                autoFocus
-                className="pr-20 font-mono text-[13px]"
-              />
-              <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-1.5">
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="pointer-events-auto h-7 w-7"
-                  onClick={() => setShowAdminKeyPlain((v) => !v)}
-                  disabled={updatingAdminKey}
-                  title={showAdminKeyPlain ? "隐藏" : "显示"}
-                >
-                  {showAdminKeyPlain ? (
-                    <EyeOff className="h-3.5 w-3.5" />
-                  ) : (
-                    <Eye className="h-3.5 w-3.5" />
-                  )}
-                </Button>
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="pointer-events-auto h-7 w-7"
-                  onClick={async () => {
-                    if (!newAdminKey.trim()) {
-                      toast.error("请先输入或生成 Key 再复制");
-                      return;
-                    }
-                    try {
-                      await navigator.clipboard.writeText(newAdminKey);
-                      toast.success("已复制到剪贴板");
-                    } catch {
-                      toast.error("复制失败，请手动选择文本");
-                    }
-                  }}
-                  disabled={updatingAdminKey}
-                  title="复制"
-                >
-                  <Copy className="h-3.5 w-3.5" />
-                </Button>
-              </div>
-            </div>
-            <div className="flex items-center justify-between gap-2">
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                onClick={() => {
-                  const key = generateApiKey(
-                    keyEditMode === "admin" ? "sk-admin-" : "sk-kiro-",
-                  );
-                  setNewAdminKey(key);
-                  setShowAdminKeyPlain(true);
-                }}
-                disabled={updatingAdminKey}
-              >
-                <Wand2 className="h-3.5 w-3.5" />
-                生成随机 Key
-              </Button>
-              <p className="text-[11px] text-muted-foreground">
-                建议生成后立即复制保存，确认更新后即生效。
-              </p>
-            </div>
-            <DialogFooter>
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => setAdminKeyDialogOpen(false)}
-                disabled={updatingAdminKey}
-              >
-                取消
-              </Button>
-              <Button
-                type="submit"
-                disabled={updatingAdminKey || !newAdminKey.trim()}
-              >
-                {updatingAdminKey ? "更新中…" : "确认更新"}
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }

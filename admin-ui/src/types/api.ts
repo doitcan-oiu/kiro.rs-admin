@@ -295,11 +295,6 @@ export interface UpdateCheckInfo {
   warning?: string
 }
 
-// Admin Key 修改
-export interface UpdateAdminKeyRequest {
-  newKey: string
-}
-
 // IdC 设备授权登录
 export interface StartIdcLoginRequest {
   region: string

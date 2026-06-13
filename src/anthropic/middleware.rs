@@ -9,7 +9,6 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
-use parking_lot::RwLock;
 
 use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::trace_db::{SharedTraceStore, TraceKeySource};
@@ -23,9 +22,9 @@ use super::types::ErrorResponse;
 /// 命中的鉴权上下文（注入到请求扩展，供 handler 记录用量）
 #[derive(Clone, Debug)]
 pub struct KeyContext {
-    /// 命中的客户端 Key id；0 表示用 master apiKey 调用
+    /// 命中的客户端 Key id
     pub key_id: u64,
-    /// 该 Key 绑定的账号分组；None 表示未绑定（含 master apiKey），可使用全部账号
+    /// 该 Key 绑定的账号分组；None 表示未绑定，可使用全部账号
     pub group: Option<String>,
     /// 命中的入口 Key 类型。
     pub key_source: TraceKeySource,
@@ -34,8 +33,6 @@ pub struct KeyContext {
 /// 应用共享状态
 #[derive(Clone)]
 pub struct AppState {
-    /// API 密钥（运行时可修改，与 Admin 持久化共享）
-    pub api_key: Arc<RwLock<String>>,
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
@@ -54,28 +51,10 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// 创建新的应用状态
-    ///
-    /// 默认入口通过 `with_provider` 注入 `KiroProvider`；这个简化构造函数留给
-    /// 下游 lib 用户使用（e.g. 测试、嵌入到其他服务时）。
+    /// 创建新的应用状态（不含 client_keys 的基础构造，供嵌入 / 测试使用）
     #[allow(dead_code)]
-    pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
+    pub fn new(extract_thinking: bool) -> Self {
         Self {
-            api_key: Arc::new(RwLock::new(api_key.into())),
-            kiro_provider: None,
-            extract_thinking,
-            client_keys: None,
-            usage_recorder: None,
-            usage_aggregator: None,
-            cache_meter: None,
-            trace_store: None,
-        }
-    }
-
-    /// 使用现有 Arc 共享 api_key（用于与 Admin 模块共享同一份内存）
-    pub fn with_shared_api_key(api_key: Arc<RwLock<String>>, extract_thinking: bool) -> Self {
-        Self {
-            api_key,
             kiro_provider: None,
             extract_thinking,
             client_keys: None,
@@ -135,18 +114,7 @@ pub async fn auth_middleware(
         }
     };
 
-    // 1) master apiKey
-    let master = state.api_key.read().clone();
-    if auth::constant_time_eq(&presented, &master) {
-        request.extensions_mut().insert(KeyContext {
-            key_id: 0,
-            group: None,
-            key_source: TraceKeySource::MasterApiKey,
-        });
-        return next.run(request).await;
-    }
-
-    // 2) 客户端 Key
+    // 所有 Key 统一走客户端 Key 管理器校验
     if let Some(mgr) = &state.client_keys {
         if let Some(id) = mgr.verify_and_touch(&presented) {
             let group = mgr.group_of(id);

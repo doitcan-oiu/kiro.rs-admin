@@ -21,7 +21,7 @@ use super::{
         SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
-        UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
+        UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
@@ -681,57 +681,6 @@ pub async fn poll_idc_relogin(
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
-}
-
-/// PUT /api/admin/config/admin-key
-/// 修改登录API密钥并持久化到配置文件
-pub async fn update_admin_key(
-    State(state): State<AdminState>,
-    Json(payload): Json<UpdateAdminKeyRequest>,
-) -> impl IntoResponse {
-    use axum::http::StatusCode;
-    let new_key = payload.new_key.trim().to_string();
-    if new_key.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(super::types::AdminErrorResponse::invalid_request(
-                "新登录API密钥不能为空",
-            )),
-        )
-            .into_response();
-    }
-
-    // 更新内存中的认证 key
-    *state.admin_api_key.write() = new_key.clone();
-
-    // 通过 service 持久化到 config.json（从磁盘加载最新后再写，避免覆盖其他字段）
-    state.service.persist_admin_key(&new_key);
-
-    Json(SuccessResponse::new("登录API密钥已更新")).into_response()
-}
-
-/// PUT /api/admin/config/api-key
-/// 修改管理员API密钥并持久化到配置文件
-///
-/// 内存中的认证 key 与 anthropic 路由共享，调用后 `/v1/*` 立刻使用新 key。
-pub async fn update_api_key(
-    State(state): State<AdminState>,
-    Json(payload): Json<UpdateAdminKeyRequest>,
-) -> impl IntoResponse {
-    use axum::http::StatusCode;
-    let new_key = payload.new_key.trim().to_string();
-    if new_key.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(super::types::AdminErrorResponse::invalid_request(
-                "新管理员API密钥不能为空",
-            )),
-        )
-            .into_response();
-    }
-    *state.api_key.write() = new_key.clone();
-    state.service.persist_api_key(&new_key);
-    Json(SuccessResponse::new("管理员API密钥已更新")).into_response()
 }
 
 // ============ 客户端 API Key 分发 ============

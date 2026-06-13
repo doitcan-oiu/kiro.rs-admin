@@ -638,16 +638,6 @@ pub struct UpdateCheckInfo {
     pub warning: Option<String>,
 }
 
-// ============ 登录API密钥修改 ============
-
-/// 修改登录API密钥请求
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateAdminKeyRequest {
-    /// 新的登录API密钥
-    pub new_key: String,
-}
-
 // ============ 客户端 API Key 分发 ============
 
 /// 客户端 Key 列表项（脱敏展示）

@@ -1,14 +1,11 @@
 //! Anthropic API 路由配置
 
-use std::sync::Arc;
-
 use axum::{
     Router,
     extract::DefaultBodyLimit,
     middleware,
     routing::{get, post},
 };
-use parking_lot::RwLock;
 
 use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
@@ -26,17 +23,13 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 
 /// 创建带有 KiroProvider 的 Anthropic API 路由
 ///
-/// 当前默认入口走 [`create_router_with_shared_key`]，本函数是给嵌入到其他 Rust
-/// 项目的下游使用者预留的扩展点，因此可能在 lib 内部不被引用。
+/// 给嵌入到其他 Rust 项目的下游使用者预留的扩展点。
 #[allow(dead_code)]
 pub fn create_router_with_provider(
-    api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
 ) -> Router {
-    let shared_key = Arc::new(RwLock::new(api_key.into()));
-    create_router_with_shared_key(
-        shared_key,
+    create_router(
         kiro_provider,
         extract_thinking,
         None,
@@ -47,11 +40,9 @@ pub fn create_router_with_provider(
     )
 }
 
-/// 与 `create_router_with_provider` 相同，但允许调用方共享 api_key 内存
-/// （Admin 模块通过该 Arc 在运行时改 key 后能立刻生效）
+/// 创建 Anthropic API 路由（供 main.rs 使用）
 #[allow(clippy::too_many_arguments)]
-pub fn create_router_with_shared_key(
-    api_key: Arc<RwLock<String>>,
+pub fn create_router(
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
     client_keys: Option<SharedClientKeyManager>,
@@ -60,7 +51,7 @@ pub fn create_router_with_shared_key(
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
 ) -> Router {
-    let mut state = AppState::with_shared_api_key(api_key, extract_thinking);
+    let mut state = AppState::new(extract_thinking);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }

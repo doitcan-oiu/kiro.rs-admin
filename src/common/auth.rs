@@ -4,7 +4,6 @@ use axum::{
     body::Body,
     http::{Request, header},
 };
-use subtle::ConstantTimeEq;
 
 /// 从请求中提取 API Key
 ///
@@ -30,12 +29,5 @@ pub fn extract_api_key(request: &Request<Body>) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// 常量时间字符串比较，防止时序攻击
-///
-/// 无论字符串内容如何，比较所需的时间都是恒定的，
-/// 这可以防止攻击者通过测量响应时间来猜测 API Key。
-///
-/// 使用经过安全审计的 `subtle` crate 实现
-pub fn constant_time_eq(a: &str, b: &str) -> bool {
-    a.as_bytes().ct_eq(b.as_bytes()).into()
-}
+// constant_time_eq 已移除：统一走客户端 Key 校验后，时序安全的比较
+// 由 ClientKeyManager 内部负责，无需对外暴露独立函数。
