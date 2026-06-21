@@ -21,7 +21,7 @@ import {
   useAccountThrottleConfig, useSetAccountThrottleConfig,
 } from '@/hooks/use-credentials'
 import { useUpdateCheck } from '@/hooks/use-update-check'
-import { updateAdminKey } from '@/api/credentials'
+import { updateAdminKey, type LoadBalancingMode, LB_LABEL, nextLbMode } from '@/api/credentials'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
 
@@ -57,10 +57,10 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   }
 
   const handleToggleLoadBalancing = () => {
-    const cur = loadBalancingData?.mode || 'priority'
-    const next = cur === 'priority' ? 'balanced' : 'priority'
+    const cur = (loadBalancingData?.mode ?? 'priority') as LoadBalancingMode
+    const next = nextLbMode(cur)
     setLoadBalancingMode(next, {
-      onSuccess: () => toast.success(`已切换到${next === 'priority' ? '优先级模式' : '均衡负载模式'}`),
+      onSuccess: () => toast.success(`已切换到${LB_LABEL[next]}模式`),
       onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
     })
   }
@@ -229,7 +229,7 @@ interface ToolControls {
   isLoadingThrottle: boolean
   isSettingMode: boolean
   isSettingThrottle: boolean
-  loadBalancingMode?: 'priority' | 'balanced'
+  loadBalancingMode?: LoadBalancingMode
   openImageUpdate: () => void
   openKeyDialog: () => void
   throttleConfig?: { failover: boolean; cooldownSecs: number }
@@ -280,9 +280,7 @@ function CompactTools({ controls }: { controls: ToolControls }) {
           <Activity />
           {controls.isLoadingMode
             ? '负载均衡加载中'
-            : controls.loadBalancingMode === 'priority'
-              ? '切换到均衡负载'
-              : '切换到优先级'}
+            : `切换到${LB_LABEL[nextLbMode(controls.loadBalancingMode ?? 'priority')]}`}
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={controls.handleRefresh}>
           <RefreshCw />刷新数据
@@ -313,9 +311,7 @@ function LoadBalancingButton({ controls }: { controls: ToolControls }) {
       <span className="hidden md:inline">
         {controls.isLoadingMode
           ? '加载中…'
-          : controls.loadBalancingMode === 'priority'
-            ? '优先级'
-            : '均衡负载'}
+          : LB_LABEL[controls.loadBalancingMode ?? 'priority']}
       </span>
     </Button>
   )

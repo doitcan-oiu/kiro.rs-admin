@@ -411,15 +411,28 @@ export async function assignProxiesRoundRobin(
   return data
 }
 
+// 负载均衡模式
+export type LoadBalancingMode = 'priority' | 'balanced' | 'least_conn'
+
+// 模式循环顺序与中文标签（三态切换共用）
+export const LB_ORDER: LoadBalancingMode[] = ['priority', 'balanced', 'least_conn']
+export const LB_LABEL: Record<LoadBalancingMode, string> = {
+  priority: '优先级',
+  balanced: '均衡负载',
+  least_conn: '最少负载',
+}
+export const nextLbMode = (m: LoadBalancingMode): LoadBalancingMode =>
+  LB_ORDER[(LB_ORDER.indexOf(m) + 1) % LB_ORDER.length]
+
 // 获取负载均衡模式
-export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'balanced' }> {
-  const { data } = await api.get<{ mode: 'priority' | 'balanced' }>('/config/load-balancing')
+export async function getLoadBalancingMode(): Promise<{ mode: LoadBalancingMode }> {
+  const { data } = await api.get<{ mode: LoadBalancingMode }>('/config/load-balancing')
   return data
 }
 
 // 设置负载均衡模式
-export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
-  const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
+export async function setLoadBalancingMode(mode: LoadBalancingMode): Promise<{ mode: LoadBalancingMode }> {
+  const { data } = await api.put<{ mode: LoadBalancingMode }>('/config/load-balancing', { mode })
   return data
 }
 

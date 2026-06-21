@@ -872,6 +872,10 @@ struct CredentialEntry {
     /// `Some(t)` 且 `t > now()` 时视为不可用；`t <= now()` 时自动恢复。
     /// 不持久化，进程重启后清空。
     throttled_until: Option<Instant>,
+    /// 运行中（in-flight）请求计数。least_conn 负载均衡用。
+    /// 凭据交给调用方时 +1，请求结束时 -1（由 InFlightGuard 负责）。
+    /// 不持久化，进程重启归零（与 throttled_until 同类，纯运行时状态）。
+    in_flight: u32,
 }
 
 /// 禁用原因
@@ -1031,6 +1035,26 @@ pub struct CallContext {
     pub token: String,
 }
 
+/// in-flight 计数的 RAII 守卫（least_conn 负载均衡用）。
+///
+/// 由 provider 在 `acquire_context` 成功交出凭据后、用其持有的 `Arc<MultiTokenManager>`
+/// 构造（此时该凭据 `in_flight` 已 +1）。Drop 时对同一凭据 `in_flight -= 1`（饱和减）。
+/// 覆盖请求的所有结束路径：正常返回、continue、bail!、`?` 早退、以及 panic 展开——
+/// 只要 guard 离开作用域即归还在途计数，无需在各退出点手动减计数。
+pub struct InFlightGuard {
+    manager: std::sync::Arc<MultiTokenManager>,
+    id: u64,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut entries = self.manager.entries.lock();
+        if let Some(e) = entries.iter_mut().find(|e| e.id == self.id) {
+            e.in_flight = e.in_flight.saturating_sub(1);
+        }
+    }
+}
+
 /// 判断某账号的分组集合是否匹配请求所属分组（严格隔离）
 ///
 /// - `group = None`：Key 未绑定分组（含 master apiKey），匹配所有账号。
@@ -1115,6 +1139,7 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     throttled_until: None,
+                    in_flight: 0,
                 }
             })
             .collect();
@@ -1254,7 +1279,8 @@ impl MultiTokenManager {
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：均衡选择可用凭据
+    /// - balanced 模式：均衡选择可用凭据（成功次数最少优先）
+    /// - least_conn 模式：选择当前在途请求数最少的可用凭据
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
@@ -1298,6 +1324,16 @@ impl MultiTokenManager {
 
                 Some((entry.id, entry.credentials.clone()))
             }
+            "least_conn" => {
+                // Least-Connections 策略：选择当前在途请求数最少的凭据。
+                // 直接反映瞬时压力，天然避免惊群与「反复选中→反复 429」死循环。
+                // 平局按优先级（数字小者优先），再平按累计成功数（在空闲均势下更均衡）。
+                let entry = available
+                    .iter()
+                    .min_by_key(|e| (e.in_flight, e.credentials.priority, e.success_count))?;
+
+                Some((entry.id, entry.credentials.clone()))
+            }
             _ => {
                 // priority 模式（默认）：选择优先级最高的
                 let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
@@ -1331,11 +1367,13 @@ impl MultiTokenManager {
             }
 
             let (id, credentials) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+                // priority 模式固定 current_id；balanced / least_conn 每次重新选择
+                let re_select_each_request =
+                    self.load_balancing_mode.lock().as_str() != "priority";
 
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
+                // 非 priority 模式：每次请求都重新选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
+                let current_hit = if re_select_each_request {
                     None
                 } else {
                     let entries = self.entries.lock();
@@ -1398,6 +1436,9 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
+                    // 仅在最终把凭据交给调用方时 +1（least_conn 在途计数）。
+                    // 上面 token 重载的 continue 不会到达这里，故不会误增。
+                    self.inc_in_flight(ctx.id);
                     return Ok(ctx);
                 }
                 Err(e) => {
@@ -1807,6 +1848,27 @@ impl MultiTokenManager {
 
         if should_flush {
             self.save_stats();
+        }
+    }
+
+    /// 对指定凭据 `in_flight += 1`（饱和加）。
+    ///
+    /// 仅在 `acquire_context` 最终把凭据交给调用方时调用一次。必须在未持有
+    /// `entries` 锁时调用（parking_lot 非重入）；调用点见 `acquire_context` 的 Ok 返回处。
+    pub(crate) fn inc_in_flight(&self, id: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
+            e.in_flight = e.in_flight.saturating_add(1);
+        }
+    }
+
+    /// 为指定凭据构造 in-flight RAII 守卫（provider 用其持有的 Arc 调用）。
+    ///
+    /// 与 `inc_in_flight` 配对：`acquire_context` 内已 +1，本守卫负责在请求结束时 -1。
+    pub(crate) fn in_flight_guard(self: &std::sync::Arc<Self>, id: u64) -> InFlightGuard {
+        InFlightGuard {
+            manager: std::sync::Arc::clone(self),
+            id,
         }
     }
 
@@ -2944,6 +3006,7 @@ impl MultiTokenManager {
                 success_count: baseline_success,
                 last_used_at: None,
                 throttled_until: None,
+                in_flight: 0,
             });
         }
 
@@ -3284,7 +3347,7 @@ impl MultiTokenManager {
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         // 验证模式值
-        if mode != "priority" && mode != "balanced" {
+        if mode != "priority" && mode != "balanced" && mode != "least_conn" {
             anyhow::bail!("无效的负载均衡模式: {}", mode);
         }
 
@@ -3762,6 +3825,142 @@ mod tests {
         assert_eq!(manager.get_load_balancing_mode(), "balanced");
 
         std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[test]
+    fn test_set_load_balancing_mode_least_conn_persists() {
+        let config_path = std::env::temp_dir()
+            .join(format!("kiro-lb-least-conn-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&config_path, r#"{"loadBalancingMode":"priority"}"#).unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        manager
+            .set_load_balancing_mode("least_conn".to_string())
+            .unwrap();
+
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(persisted.load_balancing_mode, "least_conn");
+        assert_eq!(manager.get_load_balancing_mode(), "least_conn");
+
+        // 非法模式仍应拒绝
+        assert!(manager.set_load_balancing_mode("bogus".to_string()).is_err());
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[test]
+    fn test_select_least_conn_picks_min_in_flight() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "least_conn".to_string();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // A(id1) 在途 2，B(id2) 在途 0 → 应选 B
+        {
+            let mut entries = manager.entries.lock();
+            entries.iter_mut().find(|e| e.id == 1).unwrap().in_flight = 2;
+            entries.iter_mut().find(|e| e.id == 2).unwrap().in_flight = 0;
+        }
+        let pick = manager.select_next_credential(None, None);
+        assert_eq!(pick.map(|(id, _)| id), Some(2), "least_conn 应选在途最少的 B");
+
+        // 在途相等 → 平局按优先级（默认相同则按更小 id 稳定返回 A）
+        {
+            let mut entries = manager.entries.lock();
+            entries.iter_mut().find(|e| e.id == 1).unwrap().in_flight = 1;
+            entries.iter_mut().find(|e| e.id == 2).unwrap().in_flight = 1;
+        }
+        let pick = manager.select_next_credential(None, None);
+        assert_eq!(pick.map(|(id, _)| id), Some(1), "平局应按优先级稳定选 A");
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_increment_and_guard_decrement() {
+        let manager = std::sync::Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![grouped_cred("t1", &[])],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+
+        let in_flight_of = |id: u64| {
+            manager
+                .entries
+                .lock()
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.in_flight)
+                .unwrap()
+        };
+
+        assert_eq!(in_flight_of(1), 0);
+
+        let ctx = manager.acquire_context(None, None).await.unwrap();
+        // acquire 内部已 +1
+        assert_eq!(in_flight_of(1), 1, "交出凭据后 in_flight 应为 1");
+
+        // provider 侧构造 guard；drop 时归还
+        let guard = manager.in_flight_guard(ctx.id);
+        drop(guard);
+        assert_eq!(in_flight_of(1), 0, "guard drop 后 in_flight 应归零");
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_no_leak_multi() {
+        let manager = std::sync::Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![grouped_cred("t1", &[]), grouped_cred("t2", &[])],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        // least_conn 才会每次重选不同凭据
+        manager
+            .set_load_balancing_mode("least_conn".to_string())
+            .unwrap();
+
+        let in_flight_of = |id: u64| {
+            manager
+                .entries
+                .lock()
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.in_flight)
+                .unwrap()
+        };
+
+        // 两次 acquire：least_conn 第二次应转向另一张（首张已 in_flight=1）
+        let ctx1 = manager.acquire_context(None, None).await.unwrap();
+        let g1 = manager.in_flight_guard(ctx1.id);
+        let ctx2 = manager.acquire_context(None, None).await.unwrap();
+        let _g2 = manager.in_flight_guard(ctx2.id);
+
+        assert_ne!(ctx1.id, ctx2.id, "least_conn 第二次应选在途更少的另一张");
+        assert_eq!(in_flight_of(ctx1.id), 1);
+        assert_eq!(in_flight_of(ctx2.id), 1);
+
+        // 仅释放第一张：只它归零，另一张不受影响
+        let first = ctx1.id;
+        drop(g1);
+        assert_eq!(in_flight_of(first), 0, "释放的凭据归零");
+        assert_eq!(in_flight_of(ctx2.id), 1, "未释放的凭据保持 1");
     }
 
     #[tokio::test]

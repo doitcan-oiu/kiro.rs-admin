@@ -271,6 +271,8 @@ impl KiroProvider {
                     continue;
                 }
             };
+            // least_conn 在途计数守卫：随本次迭代作用域结束自动 -1（具名绑定，勿用裸 `_`）。
+            let _in_flight = self.token_manager.in_flight_guard(ctx.id);
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -443,6 +445,9 @@ impl KiroProvider {
                     continue;
                 }
             };
+            // least_conn 在途计数守卫：随本次迭代作用域结束自动 -1，覆盖所有退出路径
+            // （return/continue/bail!/? 早退）。必须具名绑定，裸 `_` 会立即 Drop。
+            let _in_flight = self.token_manager.in_flight_guard(ctx.id);
 
             // 确保 Enterprise / IdC 账号的真实 profileArn 已解析（流式端点强制要求）
             self.ensure_profile_arn(&mut ctx).await;
