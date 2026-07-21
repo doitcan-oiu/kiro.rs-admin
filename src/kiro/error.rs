@@ -25,11 +25,6 @@ impl UpstreamRateLimitError {
     pub fn retry_after(&self) -> Option<&str> {
         self.retry_after.as_deref()
     }
-
-    /// Without an explicit upstream delay, a short local retry is still useful.
-    pub(crate) fn should_retry_locally(&self) -> bool {
-        self.retry_after.is_none()
-    }
 }
 
 fn normalize_retry_after(value: String) -> Option<String> {
@@ -53,18 +48,15 @@ mod tests {
     fn accepts_delta_seconds_and_http_date() {
         let seconds = UpstreamRateLimitError::new(Some(" 1800 ".to_string()));
         assert_eq!(seconds.retry_after(), Some("1800"));
-        assert!(!seconds.should_retry_locally());
 
         let date = "Sun, 12 Jul 2026 02:30:00 GMT";
         let http_date = UpstreamRateLimitError::new(Some(date.to_string()));
         assert_eq!(http_date.retry_after(), Some(date));
-        assert!(!http_date.should_retry_locally());
     }
 
     #[test]
     fn rejects_invalid_retry_after() {
         let error = UpstreamRateLimitError::new(Some("not-a-retry-delay".to_string()));
         assert_eq!(error.retry_after(), None);
-        assert!(error.should_retry_locally());
     }
 }

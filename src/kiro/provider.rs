@@ -408,14 +408,12 @@ impl KiroProvider {
                         status,
                         body
                     );
-                    last_error = if let Some(rate_limit) = rate_limit_error {
-                        if !rate_limit.should_retry_locally() {
-                            return Err(rate_limit.into());
-                        }
-                        Some(rate_limit.into())
+                    // 429 一律按端点级瞬态错误处理，不因 Retry-After 提前抛出（与 API 路径一致）。
+                    last_error = Some(if let Some(rate_limit) = rate_limit_error {
+                        rate_limit.into()
                     } else {
-                        Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body))
-                    };
+                        anyhow::anyhow!("MCP 请求失败: {} {}", status, body)
+                    });
                     continue;
                 }
 
@@ -719,19 +717,14 @@ impl KiroProvider {
                         outcome::TRANSIENT, Some(&body), hop_start,
                     );
                     hop += 1;
-                    last_error = if let Some(rate_limit) = rate_limit_error {
-                        if !rate_limit.should_retry_locally() {
-                            return Err(rate_limit.into());
-                        }
-                        Some(rate_limit.into())
+                    // 429 一律按端点级瞬态错误处理：切到下一个端点、进入下一轮重试，
+                    // 不因响应携带 Retry-After 就提前抛出——多端点、多轮重试后仍可能 200。
+                    // 类型化 429 仍保留为 last_error，供全部重试耗尽后向客户端透传 Retry-After。
+                    last_error = Some(if let Some(rate_limit) = rate_limit_error {
+                        rate_limit.into()
                     } else {
-                        Some(anyhow::anyhow!(
-                            "{} API 请求失败: {} {}",
-                            api_type,
-                            status,
-                            body
-                        ))
-                    };
+                        anyhow::anyhow!("{} API 请求失败: {} {}", api_type, status, body)
+                    });
                     continue;
                 }
 

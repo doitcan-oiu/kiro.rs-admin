@@ -1018,12 +1018,23 @@ impl ToolJsonAccumulator {
         )))
     }
 
-    /// 流结束时收尾：若仍有从未收到 `stop=true` 的缓冲，说明上游在工具参数
-    /// 写到一半时截断，返回 `IncompleteJson`（取字节数最多的那个作代表）。
-    pub fn finish(&mut self) -> Result<(), ToolJsonAccumulatorError> {
+    /// 流结束时收尾。
+    ///
+    /// - **非空但从未收到 `stop=true`** 的缓冲：上游在工具参数写到一半时截断，属真正的
+    ///   半截 JSON，返回 `IncompleteJson`（取字节数最多的那个作代表）。
+    /// - **空参数（0 字节）** 的缓冲：这类是合法的空入参工具调用（`{}`，如无参数的
+    ///   `breath` 之类），只是流干净结束时未携带显式 `stop=true`。不应记为截断错误，
+    ///   而是按 `push` 中空参数=`{}` 的同一口径补发为完整调用，避免把一次成功的请求
+    ///   误标为失败、也不丢失该工具调用。
+    pub fn finish(
+        &mut self,
+        tool_name_map: &HashMap<String, String>,
+    ) -> Result<Vec<CompletedToolUse>, ToolJsonAccumulatorError> {
+        // 先判定真正的半截截断：仍有实际字节但从未 stop。
         if let Some((tool_use_id, (name, input))) = self
             .buffers
             .iter()
+            .filter(|(_, (_, input))| !input.trim().is_empty())
             .max_by_key(|(_, (_, input))| input.len())
             .map(|(id, (name, input))| (id.clone(), (name.clone(), input.clone())))
         {
@@ -1034,7 +1045,17 @@ impl ToolJsonAccumulator {
                 bytes: input.len(),
             });
         }
-        Ok(())
+
+        // 其余均为空参数缓冲：补发为完整的空入参调用。按 id 排序保证输出确定性。
+        let mut completed: Vec<CompletedToolUse> = self
+            .buffers
+            .drain()
+            .map(|(id, (name, _))| {
+                CompletedToolUse::from_kiro(id, &name, serde_json::json!({}), tool_name_map)
+            })
+            .collect();
+        completed.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(completed)
     }
 }
 
@@ -2440,14 +2461,21 @@ impl StreamContext {
             events.extend(self.drain_invoke_sniff_buffer(true));
         }
 
-        // 收尾检查工具调用累积器：若仍有 tool_use 从未收到 stop=true（上游在参数
-        // 写到一半时截断），记为错误。process_tool_use 中已置位的错误保持不变。
-        if self.tool_json_error.is_none()
-            && let Err(e) = self.tool_json_accumulator.finish()
-        {
-            tracing::error!("{}", e);
-            self.tool_json_error = Some(e);
-            self.state_manager.set_stop_reason("error");
+        // 收尾检查工具调用累积器：真正的半截 JSON（有字节但从未 stop）记为错误；
+        // 空参数缓冲则补发为完整的空入参调用。process_tool_use 中已置位的错误保持不变。
+        if self.tool_json_error.is_none() {
+            match self.tool_json_accumulator.finish(&self.tool_name_map) {
+                Ok(completed) => {
+                    for tool_use in completed {
+                        events.extend(self.emit_completed_tool_use(tool_use));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("{}", e);
+                    self.tool_json_error = Some(e);
+                    self.state_manager.set_stop_reason("error");
+                }
+            }
         }
 
         // 互斥口径：total 真值（contextUsage 优先）− 缓存覆盖 = 未缓存的 input。
@@ -2700,10 +2728,27 @@ mod tests {
             .unwrap()
             .is_none()
         );
-        let err = acc.finish().unwrap_err();
+        let err = acc.finish(&HashMap::new()).unwrap_err();
         assert!(matches!(err, ToolJsonAccumulatorError::IncompleteJson { .. }));
         // 已取出残留后再 finish() 应成功。
-        assert!(acc.finish().is_ok());
+        assert!(acc.finish(&HashMap::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tool_json_accumulator_empty_buffer_without_stop_completes() {
+        // 空入参、从未 stop=true（流干净结束）：应视为合法的空参数工具调用而非半截截断，
+        // finish() 补发完整调用而不报错——避免把成功请求误标为失败、也不丢失该工具调用。
+        let mut acc = ToolJsonAccumulator::new();
+        assert!(
+            acc.push(&tool_evt("t1", "breath", "", false), &HashMap::new())
+                .unwrap()
+                .is_none()
+        );
+        let completed = acc.finish(&HashMap::new()).unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id, "t1");
+        assert_eq!(completed[0].name, "breath");
+        assert_eq!(completed[0].input, serde_json::json!({}));
     }
 
     #[test]

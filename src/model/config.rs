@@ -158,7 +158,7 @@ pub struct Config {
 
     /// 端点特定的配置
     ///
-    /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
+    /// 键为端点名（如 "ide" / "runtime"），值为该端点自由定义的参数对象。
     /// 未在此表出现的端点沿用实现内置默认值。
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,

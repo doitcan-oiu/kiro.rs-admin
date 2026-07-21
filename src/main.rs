@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use kiro::endpoint::{
-    AmazonQEndpoint, CliEndpoint, CodeWhispererEndpoint, IdeEndpoint, KiroEndpoint, RuntimeEndpoint,
+    AmazonQEndpoint, CodeWhispererEndpoint, IdeEndpoint, KiroEndpoint, RuntimeEndpoint,
 };
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
@@ -125,13 +125,11 @@ async fn main() {
     //    —— us-east-1 走独有主机，又一个独立限流桶（对齐 demo 的 CodeWhisperer 端点）
     // 4. amazonq（q.amazonaws.com + x-amz-target: AmazonQDeveloperStreamingService.SendMessage）
     //    —— 与 ide/runtime 是不同上游服务/限流桶的又一路回退（对齐 demo 的 AmazonQ 端点）
-    // 5. cli（Amazon Q for CLI，x-amz-json 协议）—— 不同协议的回退
     let endpoints: Vec<Arc<dyn KiroEndpoint>> = vec![
         Arc::new(IdeEndpoint::new()),
         Arc::new(RuntimeEndpoint::new()),
         Arc::new(CodeWhispererEndpoint::new()),
         Arc::new(AmazonQEndpoint::new()),
-        Arc::new(CliEndpoint::new()),
     ];
 
     let endpoint_names: Vec<String> = endpoints.iter().map(|e| e.name().to_string()).collect();

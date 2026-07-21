@@ -1,6 +1,6 @@
 //! Kiro 端点抽象
 //!
-//! 不同 Kiro 端点（如 `ide` / `cli`）在 URL、请求头、请求体上存在差异，
+//! 不同 Kiro 端点（如 `ide` / `runtime`）在 URL、请求头、请求体上存在差异，
 //! 但共享凭据池、Token 刷新、重试逻辑和 AWS event-stream 响应解码。
 //!
 //! [`KiroEndpoint`] 抽象了请求侧的差异点；`KiroProvider` 持有一个**有序**端点列表，
@@ -13,13 +13,11 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
 pub mod amazonq;
-pub mod cli;
 pub mod codewhisperer;
 pub mod ide;
 pub mod runtime;
 
 pub use amazonq::AmazonQEndpoint;
-pub use cli::CliEndpoint;
 pub use codewhisperer::CodeWhispererEndpoint;
 pub use ide::IdeEndpoint;
 pub use runtime::RuntimeEndpoint;
