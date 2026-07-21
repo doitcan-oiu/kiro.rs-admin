@@ -878,6 +878,9 @@ pub struct ExportedCredentials {
     pub csrf_token: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
+    /// Kiro API Key（api_key 凭据）；导出后可原样往返导入。仅 api_key 凭据有值。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kiro_api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

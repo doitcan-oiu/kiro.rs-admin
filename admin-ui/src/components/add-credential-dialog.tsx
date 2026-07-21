@@ -224,6 +224,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </div>
               <p className="text-xs text-muted-foreground">
                 均可留空使用全局配置。Auth Region 用于 Token 刷新，API Region 用于 API 请求
+                {isApiKey && '；API Key 模式留空时会自动探测正确区域'}
               </p>
             </div>
 

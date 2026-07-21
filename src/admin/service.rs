@@ -328,36 +328,54 @@ fn cleanup_other_staged(exe: &std::path::Path, keep_version: &str) {
 
 /// 将单个凭据映射为嵌套 `Account` 结构
 ///
-/// API Key 凭据无 refreshToken，导出格式无对应字段，跳过。
+/// API Key 凭据无 refreshToken，改为导出 `kiroApiKey` + `authMethod=api_key`，
+/// 可原样往返导入。OAuth 凭据仍要求 refreshToken，缺失时跳过。
 /// 空字符串字段会被过滤，保持导出 JSON 整洁。
 fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount> {
-    let refresh_token = cred
-        .refresh_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)?;
-
     fn non_empty(value: Option<String>) -> Option<String> {
         value
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     }
 
-    // authMethod 规范化："idc" → "IdC"，其余按 social 处理
-    // authMethod 规范化："idc" → "IdC"，"external_idp" 保留，其余按 social 处理
-    let auth_method = non_empty(cred.auth_method.clone()).map(|m| {
-        if m.eq_ignore_ascii_case("idc")
-            || m.eq_ignore_ascii_case("builder-id")
-            || m.eq_ignore_ascii_case("iam")
-        {
-            "IdC".to_string()
-        } else if cred.is_external_idp_credential() {
-            "external_idp".to_string()
-        } else {
-            "social".to_string()
-        }
-    });
+    let is_api_key = cred.is_api_key_credential();
+
+    // api_key 凭据：导出 kiroApiKey，不要求 refreshToken；
+    // OAuth 凭据：必须有 refreshToken，否则跳过（无法往返导入）。
+    let kiro_api_key = if is_api_key {
+        non_empty(cred.kiro_api_key.clone())
+    } else {
+        None
+    };
+    let refresh_token = if is_api_key {
+        None
+    } else {
+        Some(
+            cred.refresh_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)?,
+        )
+    };
+
+    // authMethod 规范化："idc" → "IdC"，"api_key" 保留，"external_idp" 保留，其余按 social 处理
+    let auth_method = if is_api_key {
+        Some("api_key".to_string())
+    } else {
+        non_empty(cred.auth_method.clone()).map(|m| {
+            if m.eq_ignore_ascii_case("idc")
+                || m.eq_ignore_ascii_case("builder-id")
+                || m.eq_ignore_ascii_case("iam")
+            {
+                "IdC".to_string()
+            } else if cred.is_external_idp_credential() {
+                "external_idp".to_string()
+            } else {
+                "social".to_string()
+            }
+        })
+    };
     let is_idc = auth_method.as_deref() == Some("IdC");
     let is_external_idp = auth_method.as_deref() == Some("external_idp");
 
@@ -407,7 +425,8 @@ fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount
     let credentials = ExportedCredentials {
         access_token: non_empty(cred.access_token).unwrap_or_default(),
         csrf_token: String::new(),
-        refresh_token: Some(refresh_token),
+        refresh_token,
+        kiro_api_key,
         client_id: non_empty(cred.client_id),
         client_secret: non_empty(cred.client_secret),
         region: non_empty(cred.region.clone())
@@ -1049,7 +1068,7 @@ impl AdminService {
 
         // 构建凭据对象
         let email = req.email.clone();
-        let new_cred = KiroCredentials {
+        let mut new_cred = KiroCredentials {
             id: None,
             access_token: req.access_token,
             refresh_token: req.refresh_token,
@@ -1079,6 +1098,42 @@ impl AdminService {
             groups: req.groups,
             source_channel: req.source_channel,
         };
+
+        // API Key 区域自动探测：api_key 凭据且未显式指定任何区域时，探测其正确区域
+        // 并写入凭据，使后续 chat 请求命中正确区域端点（而非固定回退 us-east-1）。
+        // 显式提供了区域则原样尊重，不探测。
+        let no_region_specified = [
+            new_cred.region.as_deref(),
+            new_cred.api_region.as_deref(),
+            new_cred.auth_region.as_deref(),
+        ]
+        .into_iter()
+        .all(|r| r.map(str::trim).unwrap_or("").is_empty());
+        if new_cred.is_api_key_credential() && no_region_specified {
+            if let Some(api_key) = new_cred.kiro_api_key.clone() {
+                let global = self.token_manager.proxy();
+                let effective = new_cred.effective_proxy(global.as_ref());
+                match self
+                    .token_manager
+                    .detect_api_key_region(&api_key, None, effective.as_ref())
+                    .await
+                {
+                    Ok(Some(region)) => {
+                        tracing::info!("API Key 凭据区域自动识别为 {}", region);
+                        new_cred.region = Some(region);
+                    }
+                    Ok(None) => {
+                        tracing::warn!("API Key 区域自动探测无命中，回退默认区域");
+                    }
+                    Err(e) => {
+                        return Err(AdminServiceError::InvalidCredential(format!(
+                            "API Key 校验失败: {}",
+                            e
+                        )));
+                    }
+                }
+            }
+        }
 
         // 调用 token_manager 添加凭据
         let credential_id = self
@@ -3116,12 +3171,15 @@ mod tests {
     }
 
     #[test]
-    fn export_skips_api_key_credentials() {
+    fn export_includes_api_key_credentials() {
         let mut cred = KiroCredentials::default();
         cred.kiro_api_key = Some("ksk_abc".to_string());
         cred.auth_method = Some("api_key".to_string());
-        // 无 refreshToken → 跳过
-        assert!(credential_to_export_account(cred).is_none());
+        // api_key 凭据无 refreshToken，但应导出 kiroApiKey + authMethod=api_key，可往返导入
+        let acc = credential_to_export_account(cred).expect("api_key 凭据应可导出");
+        assert_eq!(acc.credentials.kiro_api_key.as_deref(), Some("ksk_abc"));
+        assert_eq!(acc.credentials.auth_method.as_deref(), Some("api_key"));
+        assert_eq!(acc.credentials.refresh_token, None);
     }
 
     #[test]

@@ -568,6 +568,145 @@ pub(crate) async fn get_usage_limits(
     );
 }
 
+/// API Key 区域探测的默认候选区域（getUsageLimits 仅在这两个区域提供服务）。
+const DEFAULT_API_KEY_REGIONS: &[&str] = &["us-east-1", "eu-central-1"];
+
+/// 单区域 getUsageLimits 探测结果。
+enum ApiKeyProbe {
+    /// 该区域命中（HTTP 200）——即为该 api_key 的正确区域
+    Hit,
+    /// 该区域不适用（如 404 wrong-region / 5xx / 网络错误）——应尝试下一个区域
+    Miss,
+    /// 致命错误（401 / 403 / 402）——key 本身无效或欠费，应停止探测
+    Fatal(String),
+}
+
+/// 构建 API Key 区域探测的有序候选区域列表。
+///
+/// `hint`（若非空）永远排第一；其后为 `KIRO_APIKEY_REGIONS` 环境变量（逗号分隔，
+/// 设置时替换默认集）或内置默认集 [`DEFAULT_API_KEY_REGIONS`]。按插入顺序去重。
+fn api_key_region_candidates(hint: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |raw: &str| {
+        let r = raw.trim();
+        if !r.is_empty() && !out.iter().any(|e| e == r) {
+            out.push(r.to_string());
+        }
+    };
+    if let Some(h) = hint {
+        push(h);
+    }
+    match std::env::var("KIRO_APIKEY_REGIONS") {
+        Ok(env) if !env.trim().is_empty() => {
+            for r in env.split(',') {
+                push(r);
+            }
+        }
+        _ => {
+            for r in DEFAULT_API_KEY_REGIONS {
+                push(r);
+            }
+        }
+    }
+    out
+}
+
+/// 对给定 api_key 在**单个** region 探测 getUsageLimits（不做区域内回退）。
+///
+/// 与 [`get_usage_limits`] 的请求头构造一致，但只打一个区域端点，用于区域自动探测。
+async fn probe_api_key_usage_limits_one_region(
+    config: &Config,
+    api_key: &str,
+    region: &str,
+    proxy: Option<&ProxyConfig>,
+) -> ApiKeyProbe {
+    // 构造一个临时 api_key 凭据以复用 machine_id / header 语义
+    let credentials = KiroCredentials {
+        kiro_api_key: Some(api_key.to_string()),
+        auth_method: Some("api_key".to_string()),
+        api_region: Some(region.to_string()),
+        ..Default::default()
+    };
+    let machine_id = machine_id::generate_from_credentials(&credentials, config);
+    let kiro_version = USAGE_API_KIRO_VERSION;
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        config.system_version, config.node_version, kiro_version, machine_id
+    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+
+    let client = match build_client(proxy, 30, config.tls_backend) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!("区域探测构建 HTTP 客户端失败({}): {}", region, e);
+            return ApiKeyProbe::Miss;
+        }
+    };
+
+    let host = format!("q.{}.amazonaws.com", region);
+    let url = usage_limits_url(&host, &credentials);
+    let response = client
+        .get(&url)
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("tokentype", "API_KEY")
+        .header("Connection", "close")
+        .send()
+        .await;
+
+    let response = match response {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("区域探测请求失败({}): {}", region, e);
+            return ApiKeyProbe::Miss;
+        }
+    };
+
+    let status = response.status();
+    if status.is_success() {
+        // 200 即表示该区域为该 api_key 的正确区域（无需解析响应体）
+        ApiKeyProbe::Hit
+    } else if matches!(status.as_u16(), 401 | 402 | 403) {
+        let body = response.text().await.unwrap_or_default();
+        ApiKeyProbe::Fatal(format!("{} {}", status, body))
+    } else {
+        // 404 wrong-region / 5xx / 其它：尝试下一个区域
+        ApiKeyProbe::Miss
+    }
+}
+
+/// 探测 api_key 的正确区域（模块级实现，供 [`MultiTokenManager::detect_api_key_region`] 调用）。
+///
+/// 依次尝试 [`api_key_region_candidates`] 里的区域，返回首个命中（200）的区域。
+/// - `Ok(Some(region))`：探测到可用区域
+/// - `Ok(None)`：所有候选区域都未命中（不视为致命错误，交由调用方回退默认区域）
+/// - `Err(_)`：致命错误（401 / 403 / 402），key 本身无效或欠费
+async fn detect_api_key_region_impl(
+    config: &Config,
+    api_key: &str,
+    hint_region: Option<&str>,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<Option<String>> {
+    let candidates = api_key_region_candidates(hint_region);
+    for region in &candidates {
+        match probe_api_key_usage_limits_one_region(config, api_key, region, proxy).await {
+            ApiKeyProbe::Hit => {
+                tracing::info!("API Key 区域自动探测命中: {}", region);
+                return Ok(Some(region.clone()));
+            }
+            ApiKeyProbe::Fatal(msg) => {
+                anyhow::bail!("API Key 校验失败: {}", msg);
+            }
+            ApiKeyProbe::Miss => continue,
+        }
+    }
+    Ok(None)
+}
+
 /// 获取该凭据当前可用的模型列表
 ///
 /// 上游接口：`GET https://q.{api_region}.amazonaws.com/ListAvailableModels?origin=AI_EDITOR`
@@ -2386,6 +2525,21 @@ impl MultiTokenManager {
         tracing::info!("凭据 #{} 已解析并回填真实 profileArn: {}", id, arn);
 
         Ok(Some(arn))
+    }
+
+    /// 探测 api_key 的正确区域（导入时区域自动识别）。
+    ///
+    /// 依次探测候选区域的 getUsageLimits，返回首个命中（HTTP 200）的区域。
+    /// `hint_region` 非空时优先探测；`proxy` 为该凭据的有效代理。
+    /// - `Ok(Some(region))`：命中区域；`Ok(None)`：无命中（回退默认区域）；
+    /// - `Err(_)`：致命错误（key 无效 / 欠费）。
+    pub async fn detect_api_key_region(
+        &self,
+        api_key: &str,
+        hint_region: Option<&str>,
+        proxy: Option<&ProxyConfig>,
+    ) -> anyhow::Result<Option<String>> {
+        detect_api_key_region_impl(&self.config, api_key, hint_region, proxy).await
     }
 
     /// 获取指定凭据的使用额度（Admin API）

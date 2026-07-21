@@ -1030,7 +1030,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       const exportData = await exportKamCredentials(ids);
       const accountCount = exportData.accounts?.length ?? 0;
       if (accountCount === 0) {
-        toast.warning("勾选的凭据中没有可导出的（缺少 refreshToken）");
+        toast.warning("勾选的凭据中没有可导出的（OAuth 缺少 refreshToken / API Key 缺少 kiroApiKey）");
         return;
       }
       const json = JSON.stringify(exportData, null, 2);

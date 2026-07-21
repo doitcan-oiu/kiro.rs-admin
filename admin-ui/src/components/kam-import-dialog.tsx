@@ -32,7 +32,9 @@ interface KamAccount {
   nickname?: string
   idp?: string
   credentials: {
-    refreshToken: string
+    // OAuth 凭据用 refreshToken；API Key 凭据用 kiroApiKey（二者至少其一）
+    refreshToken?: string
+    kiroApiKey?: string
     accessToken?: string
     profileArn?: string
     // KAM 1.6.9+ 新版导出为毫秒时间戳数字，旧版为 RFC3339 字符串
@@ -85,8 +87,11 @@ interface VerificationResult {
 function normalizeKamAccount(item: unknown): unknown {
   if (typeof item !== 'object' || item === null) return item
   const obj = item as Record<string, unknown>
-  // 新格式：refreshToken 直接在账号对象上，无 credentials 嵌套
-  if (typeof obj.refreshToken === 'string' && typeof obj.credentials === 'undefined') {
+  // 新格式：refreshToken / kiroApiKey 直接在账号对象上，无 credentials 嵌套
+  if (
+    (typeof obj.refreshToken === 'string' || typeof obj.kiroApiKey === 'string') &&
+    typeof obj.credentials === 'undefined'
+  ) {
     const email = typeof obj.email === 'string' ? obj.email : undefined
     const userId =
       typeof obj.userId === 'string' || obj.userId === null ? (obj.userId as string | null) : undefined
@@ -114,6 +119,7 @@ function normalizeKamAccount(item: unknown): unknown {
     const tokenEndpoint = typeof obj.tokenEndpoint === 'string' ? obj.tokenEndpoint : undefined
     const issuerUrl = typeof obj.issuerUrl === 'string' ? obj.issuerUrl : undefined
     const scopes = typeof obj.scopes === 'string' ? obj.scopes : undefined
+    const kiroApiKey = typeof obj.kiroApiKey === 'string' ? obj.kiroApiKey : undefined
 
     return {
       email,
@@ -123,7 +129,8 @@ function normalizeKamAccount(item: unknown): unknown {
       status,
       machineId,
       credentials: {
-        refreshToken: obj.refreshToken,
+        refreshToken: typeof obj.refreshToken === 'string' ? obj.refreshToken : undefined,
+        kiroApiKey,
         accessToken,
         profileArn,
         expiresAt,
@@ -142,13 +149,15 @@ function normalizeKamAccount(item: unknown): unknown {
   return item
 }
 
-// 校验元素是否为有效的 KAM 账号结构
+// 校验元素是否为有效的 KAM 账号结构（OAuth 需 refreshToken，API Key 需 kiroApiKey）
 function isValidKamAccount(item: unknown): item is KamAccount {
   if (typeof item !== 'object' || item === null) return false
   const obj = item as Record<string, unknown>
   if (typeof obj.credentials !== 'object' || obj.credentials === null) return false
   const cred = obj.credentials as Record<string, unknown>
-  return typeof cred.refreshToken === 'string' && cred.refreshToken.trim().length > 0
+  const hasRefresh = typeof cred.refreshToken === 'string' && cred.refreshToken.trim().length > 0
+  const hasApiKey = typeof cred.kiroApiKey === 'string' && cred.kiroApiKey.trim().length > 0
+  return hasRefresh || hasApiKey
 }
 
 // 解析 KAM 导出 JSON，支持单账号和多账号格式
@@ -169,8 +178,8 @@ function parseKamJson(raw: string): KamAccount[] {
   else if (parsed.credentials && typeof parsed.credentials === 'object') {
     rawItems = [parsed]
   }
-  // 单个账号对象（新格式，refreshToken 平铺）
-  else if (typeof parsed.refreshToken === 'string') {
+  // 单个账号对象（新格式，refreshToken / kiroApiKey 平铺）
+  else if (typeof parsed.refreshToken === 'string' || typeof parsed.kiroApiKey === 'string') {
     rawItems = [parsed]
   }
   else {
@@ -182,7 +191,7 @@ function parseKamJson(raw: string): KamAccount[] {
   const validAccounts = normalizedItems.filter(isValidKamAccount)
 
   if (rawItems.length > 0 && validAccounts.length === 0) {
-    throw new Error(`共 ${rawItems.length} 条记录，但均缺少有效的 credentials.refreshToken`)
+    throw new Error(`共 ${rawItems.length} 条记录，但均缺少有效的 credentials.refreshToken 或 kiroApiKey`)
   }
 
   if (validAccounts.length < rawItems.length) {
@@ -298,9 +307,11 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         return
       }
 
-      validAccounts = accounts.filter(a => a.credentials?.refreshToken)
+      validAccounts = accounts.filter(
+        a => a.credentials?.refreshToken?.trim() || a.credentials?.kiroApiKey?.trim(),
+      )
       if (validAccounts.length === 0) {
-        toast.error('没有包含有效 refreshToken 的账号')
+        toast.error('没有包含有效 refreshToken 或 kiroApiKey 的账号')
         return
       }
     } catch (error) {
@@ -321,10 +332,15 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       })
       setResults(initialResults)
 
-      // 客户端去重
+      // 客户端去重：OAuth 按 refreshTokenHash，API Key 按 apiKeyHash
       const existingTokenHashes = new Set(
         existingCredentials?.credentials
           .map(c => c.refreshTokenHash)
+          .filter((hash): hash is string => Boolean(hash)) || []
+      )
+      const existingApiKeyHashes = new Set(
+        existingCredentials?.credentials
+          .map(c => c.apiKeyHash)
           .filter((hash): hash is string => Boolean(hash)) || []
       )
 
@@ -343,10 +359,48 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         }
 
         const cred = account.credentials
-        const token = cred.refreshToken.trim()
-        const tokenHash = await sha256Hex(token)
-
         updateResult(i, { status: 'checking' })
+
+        // API Key 凭据分支：无 refreshToken，直接用 kiroApiKey，region 留空由后端自动探测
+        const apiKey = cred.kiroApiKey?.trim() || ''
+        if (apiKey) {
+          const apiKeyHash = await sha256Hex(apiKey)
+          if (existingApiKeyHashes.has(apiKeyHash)) {
+            const existingCred = existingCredentials?.credentials.find(c => c.apiKeyHash === apiKeyHash)
+            updateResult(i, {
+              status: 'duplicate',
+              error: '该凭据已存在',
+              email: existingCred?.email || account.email,
+            })
+            continue
+          }
+          existingApiKeyHashes.add(apiKeyHash)
+
+          const apiProxyUrl = enabledProxies.length > 0
+            ? enabledProxies[Math.floor(Math.random() * enabledProxies.length)].url
+            : undefined
+
+          toImport.push({
+            index: i,
+            req: {
+              authMethod: 'api_key',
+              kiroApiKey: apiKey,
+              // region 显式给出则作为 authRegion，留空由后端 detect_api_key_region 自动探测
+              authRegion: cred.region?.trim() || undefined,
+              machineId: account.machineId?.trim() || undefined,
+              email: account.email?.trim() || undefined,
+              proxyUrl: apiProxyUrl,
+            },
+          })
+          continue
+        }
+
+        const token = cred.refreshToken?.trim() || ''
+        if (!token) {
+          updateResult(i, { status: 'failed', error: '缺少 refreshToken 或 kiroApiKey' })
+          continue
+        }
+        const tokenHash = await sha256Hex(token)
 
         // 检查重复
         if (existingTokenHashes.has(tokenHash)) {

@@ -95,14 +95,25 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   }
 
   const handleBatchImport = async (verify: boolean) => {
-    // 先单独解析 JSON，给出精准的错误提示
+    // 优先按 JSON 解析；解析失败则回退到「一行一个 API Key」纯文本模式
+    // （每个非空行视为一个 ksk_ 原始 Key，region 留空由后端自动探测）。
     let credentials: CredentialInput[]
+    const trimmedInput = jsonInput.trim()
     try {
-      const parsed = JSON.parse(jsonInput)
+      const parsed = JSON.parse(trimmedInput)
       credentials = Array.isArray(parsed) ? parsed : [parsed]
-    } catch (error) {
-      toast.error('JSON 格式错误: ' + extractErrorMessage(error))
-      return
+    } catch (jsonError) {
+      const keyLines = trimmedInput
+        .split(/\r?\n/)
+        .map(s => s.trim())
+        .filter(Boolean)
+      // 纯文本行看起来不像 JSON（无 { [）时才当作 API Key 列表，否则报 JSON 错误
+      const looksLikeJson = trimmedInput.startsWith('{') || trimmedInput.startsWith('[')
+      if (keyLines.length === 0 || looksLikeJson) {
+        toast.error('JSON 格式错误: ' + extractErrorMessage(jsonError))
+        return
+      }
+      credentials = keyLines.map(key => ({ kiroApiKey: key, authMethod: 'api_key' }))
     }
 
     if (credentials.length === 0) {
@@ -404,10 +415,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
           <div className="space-y-2">
             <label className="text-sm font-medium">
-              JSON 格式凭据
+              JSON 凭据，或每行一个 API Key
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n企业 SSO: [{"authMethod":"external_idp","refreshToken":"...","clientId":"...","tokenEndpoint":"https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token","scopes":"...","region":"eu-central-1"}]\n\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组），或直接每行粘贴一个 ksk_ API Key\n\n每行一个 API Key（region 留空自动探测）:\nksk_xxxxxxxx\nksk_yyyyyyyy\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n企业 SSO: [{"authMethod":"external_idp","refreshToken":"...","clientId":"...","tokenEndpoint":"https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token","scopes":"...","region":"eu-central-1"}]\n\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
