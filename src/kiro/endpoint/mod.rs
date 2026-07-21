@@ -3,19 +3,24 @@
 //! 不同 Kiro 端点（如 `ide` / `cli`）在 URL、请求头、请求体上存在差异，
 //! 但共享凭据池、Token 刷新、重试逻辑和 AWS event-stream 响应解码。
 //!
-//! [`KiroEndpoint`] 抽象了请求侧的差异点；`KiroProvider` 持有一个 endpoint 注册表，
-//! 按凭据的 `endpoint` 字段选择对应实现。
+//! [`KiroEndpoint`] 抽象了请求侧的差异点；`KiroProvider` 持有一个**有序**端点列表，
+//! 单次请求会按顺序对同一凭据依次尝试每个端点（多端点重试）。凭据可选地声明一个
+//! `endpoint` 首选端点排到序列最前，但不再有"默认端点选择"——不声明即尝试全部端点。
 
 use reqwest::RequestBuilder;
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
+pub mod amazonq;
 pub mod cli;
+pub mod codewhisperer;
 pub mod ide;
 pub mod runtime;
 
+pub use amazonq::AmazonQEndpoint;
 pub use cli::CliEndpoint;
+pub use codewhisperer::CodeWhispererEndpoint;
 pub use ide::IdeEndpoint;
 pub use runtime::RuntimeEndpoint;
 
@@ -23,7 +28,7 @@ pub use runtime::RuntimeEndpoint;
 ///
 /// 同一个 `KiroProvider` 可持有多个 endpoint 实现，按凭据级字段切换。
 pub trait KiroEndpoint: Send + Sync {
-    /// 端点名称（对应 credentials.endpoint / config.defaultEndpoint 的取值）
+    /// 端点名称（对应 credentials.endpoint 首选端点的取值）
     fn name(&self) -> &'static str;
 
     /// API 请求的 Content-Type（默认 application/json）
@@ -62,14 +67,6 @@ pub trait KiroEndpoint: Send + Sync {
     /// 判断响应体是否表示"上游 bearer token 失效"（触发强制刷新）
     fn is_bearer_token_invalid(&self, body: &str) -> bool {
         default_is_bearer_token_invalid(body)
-    }
-
-    /// 判断响应体是否表示"账号级临时风控"（429 + suspicious activity）
-    ///
-    /// 与普通 429（high traffic）区分：账号级风控只针对当前凭据生效，
-    /// 故障转移到其它凭据后可立即恢复；普通 429 是上游全局过载，切换无意义。
-    fn is_account_throttled(&self, body: &str) -> bool {
-        default_is_account_throttled(body)
     }
 
     /// 判断响应体是否表示"客户端请求格式错误"（messages 数组本身违反协议）
@@ -143,19 +140,6 @@ pub fn default_is_monthly_request_limit(body: &str) -> bool {
 /// 默认的 bearer token 失效判断逻辑
 pub fn default_is_bearer_token_invalid(body: &str) -> bool {
     body.contains("The bearer token included in the request is invalid")
-}
-
-/// 默认的账号级风控判断逻辑
-///
-/// 上游 Kiro/Q-Developer 风控会返回 429 + 类似：
-/// `Due to suspicious activity, we are imposing temporary limits on how
-/// frequently your account (d-...) can send a request to Kiro while we investigate.`
-///
-/// 与普通 429（high traffic / rate limit exceeded）的关键差异是
-/// 提到 "suspicious activity" 与具体账号 ID。
-pub fn default_is_account_throttled(body: &str) -> bool {
-    body.contains("suspicious activity")
-        && body.contains("temporary limits")
 }
 
 /// 默认的上游网关超时判断逻辑。
@@ -260,18 +244,6 @@ mod tests {
             "The bearer token included in the request is invalid"
         ));
         assert!(!default_is_bearer_token_invalid("unrelated error"));
-    }
-
-    #[test]
-    fn test_default_is_account_throttled() {
-        let body = r#"{"message":"Due to suspicious activity, we are imposing temporary limits on how frequently your account (d-9067c98495.84f894a8) can send a request to Kiro while we investigate.","reason":null}"#;
-        assert!(default_is_account_throttled(body));
-        // 普通 429 不应被识别为账号风控
-        assert!(!default_is_account_throttled(
-            "{\"message\":\"Too many requests\"}"
-        ));
-        // 仅有一半关键词时也不命中
-        assert!(!default_is_account_throttled("suspicious activity detected"));
     }
 
     #[test]

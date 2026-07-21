@@ -137,8 +137,9 @@ pub struct KiroCredentials {
 
     /// 端点名称（可选）
     ///
-    /// 决定该凭据走哪套 Kiro API。未配置时回退到 `config.defaultEndpoint`（默认 "ide"）。
-    /// 端点名必须在启动时注册的端点 registry 中存在。
+    /// **首选端点**：声明后会被排到多端点重试序列最前（其余端点作为回退依次跟随）。
+    /// 未配置时，请求按注册顺序依次尝试全部端点（多端点重试，不再有"默认端点"概念）。
+    /// 端点名若声明必须在启动时注册的端点列表中存在。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
 

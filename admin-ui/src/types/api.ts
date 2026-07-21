@@ -29,8 +29,6 @@ export interface CredentialStatusItem {
   proxyUrl?: string
   refreshFailureCount: number
   disabledReason?: string
-  /** 账号级风控冷却剩余秒数（>0 表示冷却中） */
-  throttledRemainingSecs?: number
   endpoint: string
   /** 账号所属分组（可属于多个分组） */
   groups?: string[]

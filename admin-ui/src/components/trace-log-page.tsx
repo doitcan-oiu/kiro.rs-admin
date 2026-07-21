@@ -96,6 +96,19 @@ function StatusBadge({ status }: { status: string }) {
   )
 }
 
+/** 端点名 → 友好展示标签（多端点重试时，每一跳都会标明命中的具体端点） */
+const ENDPOINT_LABELS: Record<string, string> = {
+  ide: 'Kiro IDE',
+  runtime: 'Kiro Runtime',
+  codewhisperer: 'CodeWhisperer',
+  amazonq: 'Amazon Q',
+  cli: 'Amazon Q CLI',
+}
+
+function endpointLabel(name: string): string {
+  return ENDPOINT_LABELS[name] ?? name
+}
+
 function formatTime(ts: string): string {
   const d = new Date(ts)
   if (isNaN(d.getTime())) return ts
@@ -157,7 +170,12 @@ function AttemptRow({ a }: { a: TraceAttempt }) {
         <Badge variant={style.variant}>{style.label}</Badge>
         <span className="text-muted-foreground">凭据</span>
         <span className="font-medium">{credLabel(a.credentialId, a.email)}</span>
-        {a.endpoint && <Badge variant="outline">{a.endpoint}</Badge>}
+        {a.endpoint && (
+          <>
+            <span className="text-muted-foreground">端点</span>
+            <Badge variant="outline">{endpointLabel(a.endpoint)}</Badge>
+          </>
+        )}
         <span className="text-muted-foreground">HTTP</span>
         <span className="font-mono">{a.httpStatus ?? '—'}</span>
         <span className="ml-auto font-mono text-muted-foreground">

@@ -888,10 +888,6 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
-    /// 临时冷却到期时间（账号级 429 风控触发后短期跳过该凭据）
-    /// `Some(t)` 且 `t > now()` 时视为不可用；`t <= now()` 时自动恢复。
-    /// 不持久化，进程重启后清空。
-    throttled_until: Option<Instant>,
 }
 
 /// 禁用原因
@@ -968,9 +964,6 @@ pub struct CredentialEntrySnapshot {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
-    /// 临时冷却剩余秒数（账号级 429 风控）；冷却中且 `> 0` 才返回
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub throttled_remaining_secs: Option<u64>,
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
@@ -1022,10 +1015,6 @@ pub struct MultiTokenManager {
     is_multiple_format: AtomicBool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
-    /// 账号级 429 风控故障转移开关（运行时可修改）
-    account_throttle_failover: AtomicBool,
-    /// 账号级风控冷却时长（秒，运行时可修改）
-    account_throttle_cooldown_secs: AtomicU64,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -1134,7 +1123,6 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     last_used_at: None,
-                    throttled_until: None,
                 }
             })
             .collect();
@@ -1180,8 +1168,6 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
-        let throttle_failover = config.account_throttle_failover;
-        let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
@@ -1193,8 +1179,6 @@ impl MultiTokenManager {
             persist_lock: Mutex::new(()),
             is_multiple_format: AtomicBool::new(is_multiple_format),
             load_balancing_mode: Mutex::new(load_balancing_mode),
-            account_throttle_failover: AtomicBool::new(throttle_failover),
-            account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -1258,11 +1242,10 @@ impl MultiTokenManager {
 
     /// 获取可用凭据数量
     pub fn available_count(&self) -> usize {
-        let now = Instant::now();
         self.entries
             .lock()
             .iter()
-            .filter(|e| !e.disabled && !e.throttled_until.map(|t| t > now).unwrap_or(false))
+            .filter(|e| !e.disabled)
             .count()
     }
 
@@ -1275,17 +1258,12 @@ impl MultiTokenManager {
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     fn select_next_credential(&self, model: Option<&str>, group: Option<&str>) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
-        let now = Instant::now();
 
         // 过滤可用凭据
         let available: Vec<_> = entries
             .iter()
             .filter(|e| {
                 if e.disabled {
-                    return false;
-                }
-                // 临时冷却中（账号级 429 风控）：跳过
-                if e.throttled_until.map(|t| t > now).unwrap_or(false) {
                     return false;
                 }
                 // 模型/分组隔离：请求模型必须由该账号支持，且账号必须匹配请求分组
@@ -1355,13 +1333,11 @@ impl MultiTokenManager {
                 } else {
                     let entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
-                    let now = Instant::now();
                     entries
                         .iter()
                         .find(|e| {
                             e.id == current_id
                                 && !e.disabled
-                                && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                                 && credential_matches_request(&e.credentials, model, group)
                         })
                         .map(|e| (e.id, e.credentials.clone()))
@@ -1871,8 +1847,6 @@ impl MultiTokenManager {
                 entry.refresh_failure_count = 0;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
-                // 成功 = 风控已解除，提前结束冷却
-                entry.throttled_until = None;
                 tracing::debug!(
                     "凭据 #{} API 调用成功（累计 {} 次）",
                     id,
@@ -2161,10 +2135,9 @@ impl MultiTokenManager {
     pub fn snapshot(&self) -> ManagerSnapshot {
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
-        let now = Instant::now();
         let available = entries
             .iter()
-            .filter(|e| !e.disabled && !e.throttled_until.map(|t| t > now).unwrap_or(false))
+            .filter(|e| !e.disabled)
             .count();
 
         ManagerSnapshot {
@@ -2231,11 +2204,6 @@ impl MultiTokenManager {
                         }
                         .to_string()
                     }),
-                    throttled_remaining_secs: e
-                        .throttled_until
-                        .and_then(|t| t.checked_duration_since(now))
-                        .map(|d| d.as_secs())
-                        .filter(|s| *s > 0),
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
@@ -2261,71 +2229,12 @@ impl MultiTokenManager {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.disabled_reason = None;
-                entry.throttled_until = None;
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
             }
         }
         // 持久化更改
         self.persist_credentials()?;
-        Ok(())
-    }
-
-    /// 标记凭据进入临时冷却期（账号级 429 风控触发）
-    ///
-    /// 与 `report_failure` 不同：不计入永久禁用，到期自动恢复，可用于"`suspicious activity` 429"
-    /// 这种短期账号级风控——当前凭据先冷却 N 分钟，故障转移到其它凭据。
-    ///
-    /// 标记凭据冷却，并在同一锁临界区内返回当前请求范围的剩余凭据数。
-    pub fn report_account_throttled_for_request(
-        &self,
-        id: u64,
-        cooldown: StdDuration,
-        model: Option<&str>,
-        group: Option<&str>,
-    ) -> usize {
-        let now = Instant::now();
-        {
-            let mut entries = self.entries.lock();
-            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                let until = now + cooldown;
-                // 取较晚的到期时间（多次触发时延长冷却）
-                entry.throttled_until = Some(match entry.throttled_until {
-                    Some(prev) if prev > until => prev,
-                    _ => until,
-                });
-                // 计入累计失败（账号风控不动连续 failure_count，避免冷却结束后误禁用）
-                entry.total_failure_count += 1;
-                tracing::warn!(
-                    "凭据 #{} 触发账号级风控，冷却 {} 秒",
-                    id,
-                    cooldown.as_secs()
-                );
-            }
-
-            let throttled_now = Instant::now();
-            entries
-                .iter()
-                .filter(|e| {
-                    !e.disabled
-                        && !e.throttled_until.map(|t| t > throttled_now).unwrap_or(false)
-                        && credential_matches_request(&e.credentials, model, group)
-                })
-                .count()
-        }
-    }
-
-    /// 手动解除指定凭据的临时冷却（Admin API）
-    ///
-    /// 即使冷却尚未到期也立即清除，让该凭据重新参与调度。
-    pub fn clear_throttle(&self, id: u64) -> anyhow::Result<()> {
-        let mut entries = self.entries.lock();
-        let entry = entries
-            .iter_mut()
-            .find(|e| e.id == id)
-            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-        entry.throttled_until = None;
-        tracing::info!("凭据 #{} 风控冷却已被手动解除", id);
         Ok(())
     }
 
@@ -2382,7 +2291,6 @@ impl MultiTokenManager {
             entry.refresh_failure_count = 0;
             entry.disabled = false;
             entry.disabled_reason = None;
-            entry.throttled_until = None;
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -2969,7 +2877,6 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
-                throttled_until: None,
             });
         }
 
@@ -3330,83 +3237,6 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    /// 获取账号级风控故障转移配置（Admin API）
-    pub fn get_account_throttle_failover(&self) -> bool {
-        self.account_throttle_failover.load(Ordering::Relaxed)
-    }
-
-    /// 获取账号级风控冷却时长秒数（Admin API）
-    pub fn get_account_throttle_cooldown_secs(&self) -> u64 {
-        self.account_throttle_cooldown_secs.load(Ordering::Relaxed)
-    }
-
-    /// 设置账号级风控故障转移配置（Admin API）
-    ///
-    /// 任一参数传 `None` 表示不修改该字段。
-    pub fn set_account_throttle_config(
-        &self,
-        failover: Option<bool>,
-        cooldown_secs: Option<u64>,
-    ) -> anyhow::Result<()> {
-        if let Some(secs) = cooldown_secs {
-            // 限定一个合理范围：1 秒到 24 小时
-            if !(1..=86_400).contains(&secs) {
-                anyhow::bail!("冷却时长必须在 1..=86400 秒内: {}", secs);
-            }
-        }
-
-        let prev_failover = self.get_account_throttle_failover();
-        let prev_cooldown = self.get_account_throttle_cooldown_secs();
-        let new_failover = failover.unwrap_or(prev_failover);
-        let new_cooldown = cooldown_secs.unwrap_or(prev_cooldown);
-
-        if new_failover == prev_failover && new_cooldown == prev_cooldown {
-            return Ok(());
-        }
-
-        self.account_throttle_failover
-            .store(new_failover, Ordering::Relaxed);
-        self.account_throttle_cooldown_secs
-            .store(new_cooldown, Ordering::Relaxed);
-
-        if let Err(err) = self.persist_account_throttle_config(new_failover, new_cooldown) {
-            // 回滚内存值
-            self.account_throttle_failover
-                .store(prev_failover, Ordering::Relaxed);
-            self.account_throttle_cooldown_secs
-                .store(prev_cooldown, Ordering::Relaxed);
-            return Err(err);
-        }
-
-        tracing::info!(
-            "账号级风控配置已更新: failover={}, cooldown_secs={}",
-            new_failover,
-            new_cooldown
-        );
-        Ok(())
-    }
-
-    fn persist_account_throttle_config(&self, failover: bool, cooldown_secs: u64) -> anyhow::Result<()> {
-        use anyhow::Context;
-
-        let config_path = match self.config.config_path() {
-            Some(path) => path.to_path_buf(),
-            None => {
-                tracing::warn!("配置文件路径未知，账号级风控配置仅在当前进程生效");
-                return Ok(());
-            }
-        };
-
-        let mut config = Config::load(&config_path)
-            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
-        config.account_throttle_failover = failover;
-        config.account_throttle_cooldown_secs = cooldown_secs;
-        config
-            .save()
-            .with_context(|| format!("持久化账号级风控配置失败: {}", config_path.display()))?;
-
-        Ok(())
-    }
 }
 
 impl Drop for MultiTokenManager {
@@ -4620,46 +4450,6 @@ mod tests {
         assert_eq!(manager.total_count_in_group(Some("g2")), 1); // B
         assert_eq!(manager.total_count_in_group(None), 3); // 全部
         assert_eq!(manager.total_count_in_group(Some("none")), 0);
-    }
-
-    #[test]
-    fn test_available_count_for_request_respects_group_throttle() {
-        let manager = MultiTokenManager::new(
-            Config::default(),
-            vec![
-                grouped_cred("a", &["g1"]),
-                grouped_cred("b", &["g2"]),
-            ],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-
-        assert_eq!(
-            manager
-                .select_next_credential(None, Some("g1"))
-                .map(|(id, _)| id),
-            Some(1)
-        );
-        // g1 的唯一凭据进入冷却后，即使全局还有 g2，g1 也必须视为无可用账号。
-        assert_eq!(
-            manager.report_account_throttled_for_request(
-                1,
-                StdDuration::from_secs(60),
-                None,
-                Some("g1"),
-            ),
-            0
-        );
-        assert!(manager.select_next_credential(None, Some("g1")).is_none());
-        assert_eq!(
-            manager
-                .select_next_credential(None, Some("g2"))
-                .map(|(id, _)| id),
-            Some(2)
-        );
-        assert_eq!(manager.snapshot().available, 1);
     }
 
     #[test]

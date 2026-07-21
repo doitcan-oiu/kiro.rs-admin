@@ -129,18 +129,6 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
-    /// 账号级 429 风控触发时是否对当前凭据进入冷却并故障转移（默认 true）。
-    ///
-    /// 关闭后：429 + suspicious activity 仍按普通瞬态错误重试，不切换凭据。
-    /// 开启后：识别到 suspicious activity 字符串时，把当前凭据冷却 `account_throttle_cooldown_secs` 秒，
-    /// 立即切换到下一个可用凭据。
-    #[serde(default = "default_account_throttle_failover")]
-    pub account_throttle_failover: bool,
-
-    /// 账号级风控冷却时长（秒，默认 1800 = 30 分钟）。
-    #[serde(default = "default_account_throttle_cooldown_secs")]
-    pub account_throttle_cooldown_secs: u64,
-
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -152,10 +140,6 @@ pub struct Config {
     /// Kiro 内置工具；`raw` 保留旧行为、直接透传客户端工具 schema，用于排障。
     #[serde(default = "default_tool_compatibility_mode")]
     pub tool_compatibility_mode: ToolCompatibilityMode,
-
-    /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
-    #[serde(default = "default_endpoint")]
-    pub default_endpoint: String,
 
     /// 是否启用请求链路追踪（写 traces.db）。默认 true。
     ///
@@ -220,13 +204,6 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
-fn default_account_throttle_failover() -> bool {
-    true
-}
-
-fn default_account_throttle_cooldown_secs() -> u64 {
-    30 * 60
-}
 
 fn default_update_auto_apply_time() -> String {
     "03:00".to_string()
@@ -238,10 +215,6 @@ fn default_extract_thinking() -> bool {
 
 fn default_tool_compatibility_mode() -> ToolCompatibilityMode {
     ToolCompatibilityMode::ClaudeCode
-}
-
-fn default_endpoint() -> String {
-    crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
 
 fn default_trace_enabled() -> bool {
@@ -283,11 +256,8 @@ impl Default for Config {
             update_auto_apply: false,
             update_auto_apply_time: default_update_auto_apply_time(),
             load_balancing_mode: default_load_balancing_mode(),
-            account_throttle_failover: default_account_throttle_failover(),
-            account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
-            default_endpoint: default_endpoint(),
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),

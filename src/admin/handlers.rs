@@ -23,7 +23,7 @@ use super::{
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest,
         CreateClientKeyRequest, CreateClientKeyResponse, GlobalProxyResponse,
-        SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
+        SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
@@ -116,18 +116,6 @@ pub async fn reset_failure_count(
         )))
         .into_response(),
         Err(e) => e.into_http_response(),
-    }
-}
-
-/// POST /api/admin/credentials/:id/clear-throttle
-/// 手动解除凭据的账号级风控冷却
-pub async fn clear_throttle(
-    State(state): State<AdminState>,
-    Path(id): Path<u64>,
-) -> impl IntoResponse {
-    match state.service.clear_throttle(id) {
-        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 风控冷却已解除", id))).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
 
@@ -519,24 +507,6 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
-        Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
-    }
-}
-
-/// GET /api/admin/config/account-throttle
-/// 获取账号级风控故障转移配置
-pub async fn get_account_throttle_config(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.service.get_account_throttle_config())
-}
-
-/// PUT /api/admin/config/account-throttle
-/// 更新账号级风控故障转移配置
-pub async fn set_account_throttle_config(
-    State(state): State<AdminState>,
-    Json(payload): Json<SetAccountThrottleConfigRequest>,
-) -> impl IntoResponse {
-    match state.service.set_account_throttle_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

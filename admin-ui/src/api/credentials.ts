@@ -138,12 +138,6 @@ export async function forceRefreshToken(
   return data
 }
 
-// 解除凭据的账号级风控冷却
-export async function clearThrottle(id: number): Promise<SuccessResponse> {
-  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/clear-throttle`)
-  return data
-}
-
 // 获取凭据余额
 export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
   const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
@@ -409,25 +403,6 @@ export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'bala
 // 设置负载均衡模式
 export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
   const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
-  return data
-}
-
-export interface AccountThrottleConfig {
-  failover: boolean
-  cooldownSecs: number
-}
-
-// 获取账号级风控故障转移配置
-export async function getAccountThrottleConfig(): Promise<AccountThrottleConfig> {
-  const { data } = await api.get<AccountThrottleConfig>('/config/account-throttle')
-  return data
-}
-
-// 更新账号级风控故障转移配置
-export async function setAccountThrottleConfig(
-  patch: Partial<AccountThrottleConfig>,
-): Promise<AccountThrottleConfig> {
-  const { data } = await api.put<AccountThrottleConfig>('/config/account-throttle', patch)
   return data
 }
 

@@ -184,7 +184,7 @@ pub struct AddCredentialRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kiro_api_key: Option<String>,
 
-    /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
+    /// 首选端点名称（可选）。声明后排到多端点重试序列最前；未声明则按注册顺序尝试全部端点。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
 
@@ -421,28 +421,6 @@ pub struct LoadBalancingModeResponse {
 pub struct SetLoadBalancingModeRequest {
     /// 模式（"priority" 或 "balanced"）
     pub mode: String,
-}
-
-/// 账号级风控故障转移配置响应
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AccountThrottleConfigResponse {
-    /// 是否启用账号级 429 故障转移
-    pub failover: bool,
-    /// 冷却时长（秒）
-    pub cooldown_secs: u64,
-}
-
-/// 更新账号级风控故障转移配置
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetAccountThrottleConfigRequest {
-    /// 是否启用故障转移；缺省表示不修改
-    #[serde(default)]
-    pub failover: Option<bool>,
-    /// 冷却时长（秒）；缺省表示不修改，1..=86400
-    #[serde(default)]
-    pub cooldown_secs: Option<u64>,
 }
 
 /// 日志治理配置响应

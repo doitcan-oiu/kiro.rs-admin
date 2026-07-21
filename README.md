@@ -45,9 +45,9 @@
 - **多凭据管理**：OAuth、Builder ID、Social、Enterprise / IdC、企业 SSO（Microsoft Entra ID / Azure AD）、Kiro API Key。
 - 自动 token 刷新：支持刷新后回写 `credentials.json`。
 - **多凭据调度**：`priority` 固定优先级和 `balanced` 均衡分配。
-- **故障转移**：凭据失败、额度用尽、账号级 429 风控冷却、token 失效强制刷新。
+- **故障转移**：凭据失败、额度用尽、token 失效强制刷新。
+- **多端点重试**：单次请求对同一凭据按顺序尝试 `ide` → `runtime` → `codewhisperer` → `amazonq` → `cli` 多个端点（相互独立的限流桶），无「默认端点选择」；凭据可选声明首选端点排到最前。
 - **profileArn 策略**：流式端点按账号类型注入真实 ARN 或 Builder ID 占位 ARN；用量类 / 头部类调用跳过占位 ARN。
-- **端点抽象**：按凭据选择 `ide` 或 `cli` endpoint。
 - **工具调用**：支持 `tool_use` / `tool_result` 配对、工具名缩短与反向映射。
 - **Thinking / Reasoning 兼容**：支持 `thinking.type=enabled` / `adaptive`、Claude Code 默认 thinking 请求、Kiro 原生 `reasoningContentEvent` 到 Anthropic thinking / signature / redacted thinking 事件的转换。
 - **WebSearch**：支持纯 `web_search` 请求和混合工具场景下的本地 agentic web_search loop。
@@ -108,8 +108,7 @@ docker compose logs --tail=200 kiro-rs
   "apiKey": "sk-kiro-rs-...",
   "adminApiKey": "sk-admin-...",
   "region": "us-east-1",
-  "tlsBackend": "rustls",
-  "defaultEndpoint": "ide"
+  "tlsBackend": "rustls"
 }
 ```
 
@@ -121,7 +120,7 @@ docker compose logs --tail=200 kiro-rs
 指定镜像版本：
 
 ```bash
-KIRO_RS_IMAGE=zyphrzero/kiro-rs:0.7.1 docker compose up -d
+KIRO_RS_IMAGE=zyphrzero/kiro-rs:0.8.0 docker compose up -d
 ```
 
 ### 下载二进制
@@ -341,8 +340,7 @@ Admin API 鉴权同样支持：
   "apiKey": "sk-kiro-rs-change-me",
   "adminApiKey": "sk-admin-change-me",
   "region": "us-east-1",
-  "tlsBackend": "rustls",
-  "defaultEndpoint": "ide"
+  "tlsBackend": "rustls"
 }
 ```
 
@@ -357,13 +355,10 @@ Admin API 鉴权同样支持：
 | `region` | `us-east-1` | 全局默认 Region |
 | `authRegion` | 无 | token 刷新用 Region，未配置时回退 `region` |
 | `apiRegion` | 无 | Kiro API 请求用 Region，未配置时回退 `region` |
-| `defaultEndpoint` | `ide` | 凭据未指定 endpoint 时使用的端点 |
 | `tlsBackend` | `rustls` | `rustls` 或 `native-tls` |
 | `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
 | `loadBalancingMode` | `priority` | `priority` 或 `balanced` |
-| `accountThrottleFailover` | `true` | 账号级 429 suspicious activity 时是否冷却并切换凭据 |
-| `accountThrottleCooldownSecs` | `1800` | 账号级风控冷却秒数 |
 | `extractThinking` | `true` | 非流式响应是否把旧 `<thinking>` 文本提取成 thinking block |
 | `traceEnabled` | `true` | 是否写入 `traces.db` |
 | `traceRetentionDays` | `7` | trace 保留天数 |
@@ -503,7 +498,7 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 | `proxyUsername` / `proxyPassword` | 凭据级代理认证 |
 | `disabled` | 是否禁用 |
 | `kiroApiKey` | `ksk_*` Kiro API Key |
-| `endpoint` | `ide` 或 `cli`，未填使用 `config.defaultEndpoint` |
+| `endpoint` | 可选的**首选端点**（`ide` / `runtime` / `codewhisperer` / `amazonq` / `cli`），声明后会被排到多端点重试序列最前；未填则按注册顺序尝试全部端点 |
 
 <a id="models"></a>
 ## 模型
@@ -683,7 +678,7 @@ data/
 说明：
 
 - `client_api_keys.json`：系统 Key 和 Admin 生成的 `sk-...` 客户端 Key，明文存储，用于鉴权。
-- `kiro_stats.json`：凭据成功 / 失败 / 额度 / 冷却等统计。
+- `kiro_stats.json`：凭据成功 / 失败 / 额度等统计。
 - `kiro_balance_cache.json`：凭据订阅、额度、邮箱等缓存。
 - `proxy_pool.json`：代理池与健康状态。
 - `cache_metering.json`：prompt cache 计量缓存，定期落盘。
@@ -712,7 +707,6 @@ Admin 还提供：
 - Social 登录和 IdC / Enterprise 登录流程。
 - 全局代理设置和代理池健康检查。
 - 负载均衡模式配置。
-- 账号级风控故障转移配置。
 - trace / usage log 保留策略。
 - 在线更新、自动更新和回退。
 
@@ -767,10 +761,12 @@ credential.proxyUrl -> config.proxyUrl -> direct
 
 故障处理：
 
+- **多端点重试**：单次请求对同一凭据按 `ide` → `runtime` → `codewhisperer` → `amazonq` → `cli` 顺序尝试；网络错误 / 408 / 429 / 5xx 等端点级瞬态错误立即切到下一个端点（相互独立的限流桶），无「默认端点选择」。
+- **无退避等待**：端点之间、凭据之间的重试都立即进行，不做任何退避 sleep（也不再有 429 专用长退避）。
 - 单凭据连续 API 失败会增加失败计数，达到阈值后跳过。
 - 402 / quota exhausted 会禁用该凭据并切换。
 - 401 / 403 中识别到 bearer token 失效时，会对该凭据强制刷新一次 token 后重试。
-- 429 + suspicious activity 可触发账号级冷却并切换凭据。
+- 429（含 suspicious activity）按普通瞬态错误处理：先切端点，再切凭据；不再有账号级冷却/锁定。上游返回明确 `Retry-After` 的 429 仍会原样透传给客户端。
 - 400 客户端请求错误不会切换凭据。
 - 网关超时和部分不可恢复错误会快速失败，避免一次请求内无限放大重试。
 
@@ -785,7 +781,7 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - 构建并推送 Docker Hub 多架构镜像。
 - 创建 GitHub Release。
 
-当前稳定版：[v0.7.1](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.7.1)。
+当前稳定版：[v0.8.0](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.8.0)。
 
 Docker 镜像：
 

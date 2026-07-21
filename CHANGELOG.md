@@ -4,6 +4,33 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-07-22
+
+主题：**上游请求改为多端点重试，去除「默认端点选择」；补齐 CodeWhisperer / AmazonQ 端点；彻底移除 429 账号级风控冷却/锁定，并取消所有重试退避**。此前每个凭据固定绑定一个端点（由 `config.defaultEndpoint` 或凭据 `endpoint` 字段选择），一个端点 429 / 5xx 时只能在同一端点上重试或直接切换凭据。本版对齐 demo（Kiro-Go）的做法：单次请求对同一凭据按顺序尝试多个相互独立限流桶的端点，一个 429 时切到下一个端点即可能立即 200。同时按需求彻底移除账号级 429「冷却锁定」功能（含前端按钮）以及所有重试退避等待。
+
+### ✨ 变更 — 多端点重试（取代默认端点选择）
+
+- **有序多端点重试**：`KiroProvider` 持有一个**有序**端点列表，单次请求对同一凭据按 `ide` → `runtime` → `codewhisperer` → `amazonq` → `cli` 顺序依次尝试。网络错误 / 408 / 429 / 5xx 等端点级瞬态错误 → 立即切到下一个端点（相互独立的限流桶）；402 额度耗尽 / 401,403 鉴权 → 按凭据故障转移；400 / 客户端格式错误 / 524 网关超时 / 其它 4xx → 立即终止。
+- **移除「默认端点选择」**：删除 `config.defaultEndpoint` 配置项。凭据的 `endpoint` 字段语义从「唯一端点」改为可选的**首选端点**——声明后排到重试序列最前，未声明则按注册顺序尝试全部端点。
+- **前端链路展示端点**：错误重试链路每一跳都标明命中的具体端点（`Kiro IDE` / `Kiro Runtime` / `CodeWhisperer` / `Amazon Q` / `Amazon Q CLI`）。
+
+### ✨ 新功能 — 补齐 CodeWhisperer / AmazonQ 端点
+
+- **新增 `amazonq` 端点**：`q.{region}.amazonaws.com/generateAssistantResponse` + `X-Amz-Target: AmazonQDeveloperStreamingService.SendMessage`（对齐 demo 的 AmazonQ 端点），与 `ide` 仅差一个 target 头，兼容 OAuth / API Key 凭据。
+- **新增 `codewhisperer` 端点**：`X-Amz-Target: AmazonCodeWhispererStreamingService.GenerateAssistantResponse`；us-east-1 走独有主机 `codewhisperer.us-east-1.amazonaws.com`（独立限流桶），非 us-east-1 无该主机，折叠回 `q.{region}.amazonaws.com`（对齐 demo 的 `regionalizeURLForRegion`）。
+- 端点数量由 `ide` / `runtime` / `cli` 三个增至五个，完整覆盖 demo 的 IDE / CodeWhisperer / AmazonQ 并保留自有的 runtime（`runtime.kiro.dev`）与 cli（Amazon Q for CLI）。
+
+### 🔧 移除 — 429 账号级风控冷却 / 锁定 + 重试退避
+
+- **彻底移除账号级 429 冷却锁定**：删除凭据 `throttled_until` 冷却锁定、`config.accountThrottleFailover` / `accountThrottleCooldownSecs` 配置、`report_account_throttled_for_request` / `clear_throttle` / 账号风控 getter/setter，以及端点侧 `is_account_throttled`（suspicious activity）检测。429 + suspicious activity 现按普通瞬态错误处理（先切端点、再切凭据）。
+- **移除所有重试退避**：删除 `retry_delay` / `retry_delay_throttle` 与全部 `sleep()` 退避——端点之间、凭据之间的重试都立即进行，不再等待。
+- **保留**：上游返回明确 `Retry-After` 的 429 仍原样透传给客户端；链路追踪里历史 `account_throttled` 记录仍可查看（不再产生新记录）。
+- **前端**：移除顶栏「账号级风控故障转移 / 冷却时长」配置按钮、凭据卡片的「冷却中」徽章与「解除风控冷却」菜单项，以及对应的 API / hooks / 类型字段。
+
+### 📝 文档
+
+- **README 更新**：功能列表、配置表、凭据字段、负载均衡与故障转移章节改为描述多端点重试与无退避语义；移除 `defaultEndpoint`、`accountThrottleFailover`、`accountThrottleCooldownSecs`；版本引用更新到 0.8.0。
+
 ## [0.7.1] - 2026-07-15
 
 主题：**打通 Codex CLI 完整工具链——桥接 function / custom / namespace 工具到 Anthropic 模型，并修复工具结果后空响应导致任务误标记完成的问题**。0.7.0 引入了 Responses 端点使 Codex CLI 能连接 kiro-rs，但此前仅支持纯聊天与 Web 搜索——Codex 的真实工具（shell / apply_patch / view_image / MCP 等）被全部剥离，导致 Codex 无法读写文件、执行命令或编辑代码。本版补全工具桥接的全链路：从 Codex 的工具声明收集、到 Anthropic 模型侧的 schema 翻译、再到响应侧按声明类型正确生成 `function_call` 或 `custom_tool_call`——实现 Codex CLI 与 kiro-rs 的完整能力对齐。

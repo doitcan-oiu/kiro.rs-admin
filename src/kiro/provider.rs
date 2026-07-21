@@ -8,8 +8,7 @@
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::time::sleep;
+use std::time::Instant;
 
 use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
 use crate::http_client::{ProxyConfig, build_client};
@@ -28,7 +27,7 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 ///
 /// 注：上游 429 多为账号级速率配额（SERVICE_REQUEST_RATE_EXCEEDED），高峰期
 /// 多账号同时触顶时，过多重试会在账号间连环撞墙、放大限流。故上限取较小值，
-/// 配合 429 专用长退避（见 retry_delay_throttle），被限时尽早返回而非耗尽配额。
+/// 被限时尽早返回而非耗尽配额（重试之间不做退避等待，立即切换端点/凭据）。
 const MAX_TOTAL_RETRIES: usize = 4;
 
 /// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
@@ -104,10 +103,13 @@ pub struct KiroProvider {
     client_cache: Mutex<ClientCache>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
-    /// 端点实现注册表（key: endpoint 名称）
-    endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
-    /// 默认端点名称（凭据未指定 endpoint 时使用）
-    default_endpoint: String,
+    /// 端点实现列表（**有序**）。
+    ///
+    /// 单次请求会按此顺序对同一凭据依次尝试每个端点（多端点重试）——
+    /// 不同端点（如 `q.amazonaws.com` 与 `runtime.kiro.dev`）是相互独立的
+    /// 限流桶，一个端点 429 / 5xx 时切到下一个端点仍可能 200。
+    /// 已不再有"默认端点选择"：凭据不再绑定单一端点。
+    endpoints: Vec<Arc<dyn KiroEndpoint>>,
     /// 已尝试过 profileArn 解析的凭据 ID（进程内）。
     ///
     /// 避免对「无 Enterprise profile」的账号（如纯 BuilderID）在每次请求都重复调用
@@ -122,18 +124,15 @@ impl KiroProvider {
     /// # Arguments
     /// * `token_manager` - 多凭据 Token 管理器
     /// * `proxy` - 全局代理配置
-    /// * `endpoints` - 端点名 → 实现的注册表（至少包含 `default_endpoint` 对应条目）
-    /// * `default_endpoint` - 凭据未显式指定 endpoint 时使用的名称
+    /// * `endpoints` - **有序**端点实现列表，单次请求按此顺序对同一凭据依次重试
     pub fn with_proxy(
         token_manager: Arc<MultiTokenManager>,
         proxy: Option<ProxyConfig>,
-        endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
-        default_endpoint: String,
+        endpoints: Vec<Arc<dyn KiroEndpoint>>,
     ) -> Self {
         assert!(
-            endpoints.contains_key(&default_endpoint),
-            "默认端点 {} 未在 endpoints 注册表中",
-            default_endpoint
+            !endpoints.is_empty(),
+            "端点列表不能为空（至少注册一个端点）"
         );
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）
@@ -147,7 +146,6 @@ impl KiroProvider {
             client_cache: Mutex::new(client_cache),
             tls_backend,
             endpoints,
-            default_endpoint,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
         }
     }
@@ -164,19 +162,31 @@ impl KiroProvider {
         Ok(client)
     }
 
-    /// 根据凭据选择 endpoint 实现
-    fn endpoint_for(
+    /// 返回本次请求应对某凭据依次尝试的**有序**端点列表（多端点重试）。
+    ///
+    /// - 默认返回全部已注册端点，顺序即注册顺序；
+    /// - 若凭据显式声明了 `endpoint`（且该名称存在），则把它排到最前作为
+    ///   首选端点，其余端点作为回退依次跟随（等价于 demo 的 preferred + fallback）；
+    ///   未知名称则忽略，回退到注册顺序。
+    ///
+    /// 不再存在"默认端点"概念：凭据不声明端点时，会按注册顺序尝试所有端点。
+    fn ordered_endpoints_for(
         &self,
         credentials: &KiroCredentials,
-    ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
-        let name = credentials
-            .endpoint
-            .as_deref()
-            .unwrap_or(&self.default_endpoint);
-        self.endpoints
-            .get(name)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+    ) -> Vec<Arc<dyn KiroEndpoint>> {
+        match credentials.endpoint.as_deref() {
+            Some(preferred) if self.endpoints.iter().any(|e| e.name() == preferred) => {
+                let mut ordered = Vec::with_capacity(self.endpoints.len());
+                ordered.extend(
+                    self.endpoints.iter().filter(|e| e.name() == preferred).cloned(),
+                );
+                ordered.extend(
+                    self.endpoints.iter().filter(|e| e.name() != preferred).cloned(),
+                );
+                ordered
+            }
+            _ => self.endpoints.clone(),
+        }
     }
 
     /// 在发起请求前，确保 Enterprise / IdC 账号的真实 profileArn 已解析并写入 `ctx`。
@@ -278,7 +288,7 @@ impl KiroProvider {
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
-        for attempt in 0..max_retries {
+        'credential: for attempt in 0..max_retries {
             // MCP 调用不涉及模型选择，但必须遵守客户端 Key 的凭据分组隔离。
             let ctx = match self.token_manager.acquire_context(None, group).await {
                 Ok(c) => c,
@@ -297,141 +307,129 @@ impl KiroProvider {
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
 
-            let endpoint = match self.endpoint_for(&ctx.credentials) {
-                Ok(e) => e,
-                Err(e) => {
-                    last_error = Some(e);
-                    // endpoint 解析失败：记为失败，换下一张凭据
-                    self.token_manager.report_failure(ctx.id);
-                    continue;
-                }
-            };
+            // 多端点重试：对同一凭据按顺序尝试每个端点（与 API 路径一致）
+            let endpoints = self.ordered_endpoints_for(&ctx.credentials);
 
-            let rctx = RequestContext {
-                credentials: &ctx.credentials,
-                token: &ctx.token,
-                machine_id: &machine_id,
-                config,
-            };
+            for endpoint in &endpoints {
+                let endpoint_name = endpoint.name();
 
-            let url = endpoint.mcp_url(&rctx);
-            let body = endpoint.transform_mcp_body(request_body, &rctx);
+                let rctx = RequestContext {
+                    credentials: &ctx.credentials,
+                    token: &ctx.token,
+                    machine_id: &machine_id,
+                    config,
+                };
 
-            let base = self
-                .client_for(&ctx.credentials)?
-                .post(&url)
-                .body(body)
-                .header("content-type", endpoint.content_type())
-                .header("Connection", "close");
-            let request = endpoint.decorate_mcp(base, &rctx);
+                let url = endpoint.mcp_url(&rctx);
+                let body = endpoint.transform_mcp_body(request_body, &rctx);
 
-            let response = match request.send().await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    tracing::warn!(
-                        "MCP 请求发送失败（尝试 {}/{}）: {}",
-                        attempt + 1,
-                        max_retries,
-                        e
-                    );
-                    last_error = Some(e.into());
-                    if attempt + 1 < max_retries {
-                        sleep(Self::retry_delay(attempt)).await;
-                    }
-                    continue;
-                }
-            };
+                let base = self
+                    .client_for(&ctx.credentials)?
+                    .post(&url)
+                    .body(body)
+                    .header("content-type", endpoint.content_type())
+                    .header("Connection", "close");
+                let request = endpoint.decorate_mcp(base, &rctx);
 
-            let status = response.status();
-            let rate_limit_error = (status.as_u16() == 429)
-                .then(|| UpstreamRateLimitError::from_headers(response.headers()));
-
-            // 成功响应
-            if status.is_success() {
-                self.token_manager.report_success(ctx.id);
-                return Ok(response);
-            }
-
-            // 失败响应
-            let body = response.text().await.unwrap_or_default();
-
-            // 402 额度用尽
-            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
-                let has_available = self.token_manager.report_quota_exhausted(ctx.id);
-                if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
-                }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
-                continue;
-            }
-
-            // 400 Bad Request
-            if status.as_u16() == 400 {
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
-            }
-
-            // 401/403 凭据问题
-            if matches!(status.as_u16(), 401 | 403) {
-                // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
-                if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
-                    force_refreshed.insert(ctx.id);
-                    tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if Self::handle_force_refresh_result(
-                        self.token_manager.force_refresh_token_for(ctx.id).await,
-                    )? {
-                        tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                let response = match request.send().await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        tracing::warn!(
+                            "MCP 请求发送失败（端点 [{}]，凭据尝试 {}/{}）: {}",
+                            endpoint_name,
+                            attempt + 1,
+                            max_retries,
+                            e
+                        );
+                        // 网络错误：换下一个端点
+                        last_error = Some(e.into());
                         continue;
                     }
-                    tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
+                };
+
+                let status = response.status();
+                let rate_limit_error = (status.as_u16() == 429)
+                    .then(|| UpstreamRateLimitError::from_headers(response.headers()));
+
+                // 成功响应
+                if status.is_success() {
+                    self.token_manager.report_success(ctx.id);
+                    return Ok(response);
                 }
 
-                let has_available = self.token_manager.report_failure(ctx.id);
-                if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                // 失败响应
+                let body = response.text().await.unwrap_or_default();
+
+                // 402 额度用尽：凭据级 → 故障转移
+                if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+                    let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                    if !has_available {
+                        anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    }
+                    last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                    continue 'credential;
                 }
+
+                // 400 Bad Request：立即终止
+                if status.as_u16() == 400 {
+                    anyhow::bail!("MCP 请求失败: {} {}", status, body);
+                }
+
+                // 401/403 凭据问题：凭据级 → 故障转移
+                if matches!(status.as_u16(), 401 | 403) {
+                    // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
+                    if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
+                        force_refreshed.insert(ctx.id);
+                        tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
+                        if Self::handle_force_refresh_result(
+                            self.token_manager.force_refresh_token_for(ctx.id).await,
+                        )? {
+                            tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                            continue 'credential;
+                        }
+                        tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
+                    }
+
+                    let has_available = self.token_manager.report_failure(ctx.id);
+                    if !has_available {
+                        anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    }
+                    last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                    continue 'credential;
+                }
+
+                // 瞬态错误：端点级 → 切到下一个端点（不同限流桶）
+                if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+                    tracing::warn!(
+                        "MCP 请求失败（上游瞬态错误，端点 [{}] 切换下一端点，凭据尝试 {}/{}）: {} {}",
+                        endpoint_name,
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+                    last_error = if let Some(rate_limit) = rate_limit_error {
+                        if !rate_limit.should_retry_locally() {
+                            return Err(rate_limit.into());
+                        }
+                        Some(rate_limit.into())
+                    } else {
+                        Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body))
+                    };
+                    continue;
+                }
+
+                // 其他 4xx：立即终止
+                if status.is_client_error() {
+                    anyhow::bail!("MCP 请求失败: {} {}", status, body);
+                }
+
+                // 兜底：端点级瞬态，换下一个端点
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 continue;
             }
 
-            // 瞬态错误
-            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
-                tracing::warn!(
-                    "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
-                    max_retries,
-                    status,
-                    body
-                );
-                last_error = if let Some(rate_limit) = rate_limit_error {
-                    if !rate_limit.should_retry_locally() {
-                        return Err(rate_limit.into());
-                    }
-                    Some(rate_limit.into())
-                } else {
-                    Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body))
-                };
-                if attempt + 1 < max_retries {
-                    // 429 限流用更长退避；408/5xx 仍用通用快速退避
-                    let delay = if status.as_u16() == 429 {
-                        Self::retry_delay_throttle(attempt)
-                    } else {
-                        Self::retry_delay(attempt)
-                    };
-                    sleep(delay).await;
-                }
-                continue;
-            }
-
-            // 其他 4xx
-            if status.is_client_error() {
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
-            }
-
-            // 兜底
-            last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
-            if attempt + 1 < max_retries {
-                sleep(Self::retry_delay(attempt)).await;
-            }
+            // 本凭据所有端点都端点级瞬态失败：立即换下一个凭据（无退避）
         }
 
         Err(last_error.unwrap_or_else(|| {
@@ -462,16 +460,21 @@ impl KiroProvider {
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
 
-        for attempt in 0..max_retries {
-            let attempt_start = Instant::now();
+        // 全局跳计数：每一次"某凭据 × 某端点"的实际请求算一跳，用于链路追踪展示。
+        // 多端点重试下，同一凭据可能贡献多跳（每个端点一跳），前端据此显示每一跳
+        // 命中的具体端点。
+        let mut hop: usize = 0;
+
+        'credential: for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self.token_manager.acquire_context(model.as_deref(), group).await {
                 Ok(c) => c,
                 Err(e) => {
                     Self::emit_attempt(
-                        sink, attempt, 0, "", None, outcome::UNKNOWN,
-                        Some(&e.to_string()), attempt_start,
+                        sink, hop, 0, "", None, outcome::UNKNOWN,
+                        Some(&e.to_string()), Instant::now(),
                     );
+                    hop += 1;
                     if is_rate_limit_error(&e) {
                         return Err(e);
                     }
@@ -489,337 +492,283 @@ impl KiroProvider {
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
 
-            let endpoint = match self.endpoint_for(&ctx.credentials) {
-                Ok(e) => e,
-                Err(e) => {
-                    Self::emit_attempt(
-                        sink, attempt, ctx.id, "", None, outcome::UNKNOWN,
-                        Some(&e.to_string()), attempt_start,
-                    );
-                    last_error = Some(e);
-                    self.token_manager.report_failure(ctx.id);
-                    continue;
-                }
-            };
-            let endpoint_name = endpoint.name();
+            // 本凭据要依次尝试的有序端点列表（多端点重试，不同端点是独立限流桶）
+            let endpoints = self.ordered_endpoints_for(&ctx.credentials);
 
-            let rctx = RequestContext {
-                credentials: &ctx.credentials,
-                token: &ctx.token,
-                machine_id: &machine_id,
-                config,
-            };
+            // ---- 多端点重试：对同一凭据按顺序尝试每个端点 ----
+            // 端点级瞬态失败（网络 / 429 限流桶 / 408 / 5xx / 未知）→ 立即切到下一个端点；
+            // 凭据级问题（402 额度耗尽 / 401,403 鉴权）→ 跳出端点循环，
+            //   按凭据故障转移到下一个凭据（continue 'credential）；
+            // 请求级问题（400 / 客户端格式错误 / 524 网关超时 / 其他 4xx）→ 立即终止（bail）。
+            for endpoint in &endpoints {
+                let hop_start = Instant::now();
+                let endpoint_name = endpoint.name();
 
-            let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx);
+                let rctx = RequestContext {
+                    credentials: &ctx.credentials,
+                    token: &ctx.token,
+                    machine_id: &machine_id,
+                    config,
+                };
 
-            tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
-            tracing::debug!("实际发送请求体: {}", body);
+                let url = endpoint.api_url(&rctx);
+                let body = endpoint.transform_api_body(request_body, &rctx);
 
-            let base = self
-                .client_for(&ctx.credentials)?
-                .post(&url)
-                .body(body)
-                .header("content-type", endpoint.content_type())
-                .header("Connection", "close");
-            let request = endpoint.decorate_api(base, &rctx);
+                tracing::debug!("使用端点 [{}] POST {}", endpoint_name, url);
+                tracing::debug!("实际发送请求体: {}", body);
 
-            // 打印实际发送的请求头（RUST_LOG=debug 时输出，便于排查问题）
-            let request = request.build().map_err(|e| anyhow::anyhow!("构建请求失败: {}", e))?;
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                for (k, v) in request.headers() {
-                    tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
-                }
-            }
-            let response = match self.client_for(&ctx.credentials)?.execute(request).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    tracing::warn!(
-                        "API 请求发送失败（尝试 {}/{}）: {}",
-                        attempt + 1,
-                        max_retries,
-                        e
-                    );
-                    Self::emit_attempt(
-                        sink, attempt, ctx.id, endpoint_name, None,
-                        outcome::NETWORK_ERROR, Some(&e.to_string()), attempt_start,
-                    );
-                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
-                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
-                    last_error = Some(e.into());
-                    if attempt + 1 < max_retries {
-                        sleep(Self::retry_delay(attempt)).await;
+                let base = self
+                    .client_for(&ctx.credentials)?
+                    .post(&url)
+                    .body(body)
+                    .header("content-type", endpoint.content_type())
+                    .header("Connection", "close");
+                let request = endpoint.decorate_api(base, &rctx);
+
+                // 打印实际发送的请求头（RUST_LOG=debug 时输出，便于排查问题）
+                let request = request.build().map_err(|e| anyhow::anyhow!("构建请求失败: {}", e))?;
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    for (k, v) in request.headers() {
+                        tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
                     }
-                    continue;
                 }
-            };
-
-            let status = response.status();
-            let rate_limit_error = (status.as_u16() == 429)
-                .then(|| UpstreamRateLimitError::from_headers(response.headers()));
-
-            // 成功响应
-            if status.is_success() {
-                Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::SUCCESS, None, attempt_start,
-                );
-                self.token_manager.report_success(ctx.id);
-                return Ok(KiroCallResult {
-                    response,
-                    credential_id: ctx.id,
-                });
-            }
-
-            // 失败响应：读取 body 用于日志/错误信息
-            let body = response.text().await.unwrap_or_default();
-
-            // 402 Payment Required 且额度用尽：禁用凭据并故障转移
-            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
-                tracing::warn!(
-                    "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
-                    attempt + 1,
-                    max_retries,
-                    status,
-                    body
-                );
-                Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::QUOTA_EXHAUSTED, Some(&body), attempt_start,
-                );
-
-                let has_available = self.token_manager.report_quota_exhausted(ctx.id);
-                if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
-                }
-
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
-                continue;
-            }
-
-            // 400 Bad Request - 请求问题，重试/切换凭据无意义
-            if status.as_u16() == 400 {
-                Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(400),
-                    outcome::BAD_REQUEST, Some(&body), attempt_start,
-                );
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
-            }
-
-            // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
-            if matches!(status.as_u16(), 401 | 403) {
-                tracing::warn!(
-                    "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
-                    max_retries,
-                    status,
-                    body
-                );
-                Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::AUTH_FAILED, Some(&body), attempt_start,
-                );
-
-                // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
-                if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
-                    force_refreshed.insert(ctx.id);
-                    tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if Self::handle_force_refresh_result(
-                        self.token_manager.force_refresh_token_for(ctx.id).await,
-                    )? {
-                        tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                let response = match self.client_for(&ctx.credentials)?.execute(request).await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        tracing::warn!(
+                            "API 请求发送失败（端点 [{}]，凭据尝试 {}/{}）: {}",
+                            endpoint_name,
+                            attempt + 1,
+                            max_retries,
+                            e
+                        );
+                        Self::emit_attempt(
+                            sink, hop, ctx.id, endpoint_name, None,
+                            outcome::NETWORK_ERROR, Some(&e.to_string()), hop_start,
+                        );
+                        hop += 1;
+                        // 网络错误通常是上游/链路瞬态问题，不禁用或切换凭据；换下一个端点。
+                        last_error = Some(e.into());
                         continue;
                     }
-                    tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
+                };
+
+                let status = response.status();
+                let rate_limit_error = (status.as_u16() == 429)
+                    .then(|| UpstreamRateLimitError::from_headers(response.headers()));
+
+                // 成功响应
+                if status.is_success() {
+                    Self::emit_attempt(
+                        sink, hop, ctx.id, endpoint_name, Some(status.as_u16()),
+                        outcome::SUCCESS, None, hop_start,
+                    );
+                    self.token_manager.report_success(ctx.id);
+                    return Ok(KiroCallResult {
+                        response,
+                        credential_id: ctx.id,
+                    });
                 }
 
-                let has_available = self.token_manager.report_failure(ctx.id);
-                if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
+                // 失败响应：读取 body 用于日志/错误信息
+                let body = response.text().await.unwrap_or_default();
+
+                // 402 Payment Required 且额度用尽：凭据级 → 禁用凭据并故障转移（不再试其它端点）
+                if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+                    tracing::warn!(
+                        "API 请求失败（额度已用尽，端点 [{}]，禁用凭据并切换，凭据尝试 {}/{}）: {} {}",
+                        endpoint_name,
+                        attempt + 1,
+                        max_retries,
                         status,
                         body
                     );
-                }
-
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
-                continue;
-            }
-
-            // 429 + suspicious activity = 账号级临时风控
-            // 仅当前凭据被针对，故障转移到其它凭据可立即恢复（受配置开关控制）。
-            if status.as_u16() == 429
-                && self.token_manager.get_account_throttle_failover()
-                && endpoint.is_account_throttled(&body)
-            {
-                let cooldown_secs = self
-                    .token_manager
-                    .get_account_throttle_cooldown_secs()
-                    .max(1);
-                let cooldown = std::time::Duration::from_secs(cooldown_secs);
-                tracing::warn!(
-                    "API 请求失败（账号级风控，凭据 #{} 冷却 {}s 并切换，尝试 {}/{}）: {}",
-                    ctx.id,
-                    cooldown_secs,
-                    attempt + 1,
-                    max_retries,
-                    body
-                );
-
-                let remaining = self
-                    .token_manager
-                    .report_account_throttled_for_request(
-                        ctx.id,
-                        cooldown,
-                        model.as_deref(),
-                        group,
+                    Self::emit_attempt(
+                        sink, hop, ctx.id, endpoint_name, Some(status.as_u16()),
+                        outcome::QUOTA_EXHAUSTED, Some(&body), hop_start,
                     );
-                Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(429),
-                    outcome::ACCOUNT_THROTTLED, Some(&body), attempt_start,
-                );
-                // 账号级风控通常不返回 Retry-After；此时使用本地实际冷却时间，
-                // 让下游网关在同一时段内也停止调度该虚拟账号。
-                let (rate_limit_error, must_wait_for_upstream) =
-                    account_rate_limit_with_fallback(rate_limit_error, cooldown_secs);
+                    hop += 1;
 
-                // 上游给出明确等待时间时必须立即交给客户端遵守，不能在同一请求中
-                // 提前换号重试。无有效 Retry-After 时仍允许按既有策略故障转移。
-                if must_wait_for_upstream {
-                    return Err(rate_limit_error.into());
-                }
-
-                if remaining == 0 {
-                    return Err(rate_limit_error.into());
-                }
-                last_error = Some(rate_limit_error.into());
-                continue;
-            }
-
-            // 客户端请求格式错误（messages 数组违反协议）：根因在调用方，重试无意义
-            // 上游常以 5xx 返回，必须在下方"瞬态错误重试"分支之前拦截，否则会被当作
-            // 上游故障重试 max_retries 次，把一个坏请求放大成多次 503（503 风暴）。
-            // 直接终止：不重试、不切换凭据、不计入凭据失败。
-            if endpoint.is_client_validation_error(&body) {
-                tracing::warn!(
-                    "API 请求失败（客户端请求格式错误，不重试）: {} {}",
-                    status,
-                    body
-                );
-                Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::BAD_REQUEST, Some(&body), attempt_start,
-                );
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
-            }
-
-            // 524 / gateway timeout：上游边缘层超时，继续在本次请求内重试通常只会
-            // 放大客户端等待时间和 Claude 端 Retrying 轮数；快速返回，让客户端下一次调用
-            // 重新建连。
-            if status.as_u16() == 524 || endpoint.is_gateway_timeout(&body) {
-                tracing::warn!(
-                    "API 请求失败（上游网关超时，不重试）: {} {}",
-                    status,
-                    body
-                );
-                Self::emit_attempt(
-                    sink,
-                    attempt,
-                    ctx.id,
-                    endpoint_name,
-                    Some(status.as_u16()),
-                    outcome::TRANSIENT,
-                    Some(&body),
-                    attempt_start,
-                );
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
-            }
-
-            // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
-            // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
-            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
-                tracing::warn!(
-                    "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
-                    max_retries,
-                    status,
-                    body
-                );
-                Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::TRANSIENT, Some(&body), attempt_start,
-                );
-                last_error = if let Some(rate_limit) = rate_limit_error {
-                    if !rate_limit.should_retry_locally() {
-                        return Err(rate_limit.into());
+                    let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                    if !has_available {
+                        anyhow::bail!(
+                            "{} API 请求失败（所有凭据已用尽）: {} {}",
+                            api_type,
+                            status,
+                            body
+                        );
                     }
-                    Some(rate_limit.into())
-                } else {
-                    Some(anyhow::anyhow!(
+
+                    last_error = Some(anyhow::anyhow!(
                         "{} API 请求失败: {} {}",
                         api_type,
                         status,
                         body
-                    ))
-                };
-                if attempt + 1 < max_retries {
-                    // 429 限流用更长退避给账号配额恢复时间；408/5xx 仍用通用快速退避
-                    let delay = if status.as_u16() == 429 {
-                        Self::retry_delay_throttle(attempt)
-                    } else {
-                        Self::retry_delay(attempt)
-                    };
-                    sleep(delay).await;
+                    ));
+                    continue 'credential;
                 }
+
+                // 400 Bad Request - 请求问题，重试/切换端点或凭据均无意义
+                if status.as_u16() == 400 {
+                    Self::emit_attempt(
+                        sink, hop, ctx.id, endpoint_name, Some(400),
+                        outcome::BAD_REQUEST, Some(&body), hop_start,
+                    );
+                    anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                }
+
+                // 401/403 - 更可能是凭据/权限问题：凭据级 → 计入失败并故障转移（不再试其它端点）
+                if matches!(status.as_u16(), 401 | 403) {
+                    tracing::warn!(
+                        "API 请求失败（可能为凭据错误，端点 [{}]，凭据尝试 {}/{}）: {} {}",
+                        endpoint_name,
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+                    Self::emit_attempt(
+                        sink, hop, ctx.id, endpoint_name, Some(status.as_u16()),
+                        outcome::AUTH_FAILED, Some(&body), hop_start,
+                    );
+                    hop += 1;
+
+                    // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
+                    if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
+                        force_refreshed.insert(ctx.id);
+                        tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
+                        if Self::handle_force_refresh_result(
+                            self.token_manager.force_refresh_token_for(ctx.id).await,
+                        )? {
+                            tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                            continue 'credential;
+                        }
+                        tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
+                    }
+
+                    let has_available = self.token_manager.report_failure(ctx.id);
+                    if !has_available {
+                        anyhow::bail!(
+                            "{} API 请求失败（所有凭据已用尽）: {} {}",
+                            api_type,
+                            status,
+                            body
+                        );
+                    }
+
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ));
+                    continue 'credential;
+                }
+
+                // 客户端请求格式错误（messages 数组违反协议）：根因在调用方，重试无意义
+                // 上游常以 5xx 返回，必须在下方"瞬态错误"分支之前拦截，否则会被当作
+                // 上游故障在各端点间反复重试，把一个坏请求放大成多次 503（503 风暴）。
+                // 直接终止：不重试、不切换端点/凭据、不计入凭据失败。
+                if endpoint.is_client_validation_error(&body) {
+                    tracing::warn!(
+                        "API 请求失败（客户端请求格式错误，不重试）: {} {}",
+                        status,
+                        body
+                    );
+                    Self::emit_attempt(
+                        sink, hop, ctx.id, endpoint_name, Some(status.as_u16()),
+                        outcome::BAD_REQUEST, Some(&body), hop_start,
+                    );
+                    anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                }
+
+                // 524 / gateway timeout：上游边缘层超时，快速返回让客户端下一次调用重新建连
+                if status.as_u16() == 524 || endpoint.is_gateway_timeout(&body) {
+                    tracing::warn!(
+                        "API 请求失败（上游网关超时，不重试）: {} {}",
+                        status,
+                        body
+                    );
+                    Self::emit_attempt(
+                        sink,
+                        hop,
+                        ctx.id,
+                        endpoint_name,
+                        Some(status.as_u16()),
+                        outcome::TRANSIENT,
+                        Some(&body),
+                        hop_start,
+                    );
+                    anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                }
+
+                // 429/408/5xx - 端点级瞬态错误：切到下一个端点（不同限流桶），不禁用或切换凭据。
+                // 429 high traffic / 502 high load 等瞬态错误在单端点上无法恢复，
+                // 但换到独立限流桶的端点后可能立即 200。
+                if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+                    tracing::warn!(
+                        "API 请求失败（上游瞬态错误，端点 [{}] 切换下一端点，凭据尝试 {}/{}）: {} {}",
+                        endpoint_name,
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+                    Self::emit_attempt(
+                        sink, hop, ctx.id, endpoint_name, Some(status.as_u16()),
+                        outcome::TRANSIENT, Some(&body), hop_start,
+                    );
+                    hop += 1;
+                    last_error = if let Some(rate_limit) = rate_limit_error {
+                        if !rate_limit.should_retry_locally() {
+                            return Err(rate_limit.into());
+                        }
+                        Some(rate_limit.into())
+                    } else {
+                        Some(anyhow::anyhow!(
+                            "{} API 请求失败: {} {}",
+                            api_type,
+                            status,
+                            body
+                        ))
+                    };
+                    continue;
+                }
+
+                // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
+                if status.is_client_error() {
+                    Self::emit_attempt(
+                        sink, hop, ctx.id, endpoint_name, Some(status.as_u16()),
+                        outcome::BAD_REQUEST, Some(&body), hop_start,
+                    );
+                    anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                }
+
+                // 兜底：当作端点级瞬态错误处理，切到下一个端点（不切换凭据）
+                tracing::warn!(
+                    "API 请求失败（未知错误，端点 [{}] 切换下一端点，凭据尝试 {}/{}）: {} {}",
+                    endpoint_name,
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                Self::emit_attempt(
+                    sink, hop, ctx.id, endpoint_name, Some(status.as_u16()),
+                    outcome::UNKNOWN, Some(&body), hop_start,
+                );
+                hop += 1;
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
                 continue;
             }
 
-            // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
-            if status.is_client_error() {
-                Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::BAD_REQUEST, Some(&body), attempt_start,
-                );
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
-            }
-
-            // 兜底：当作可重试的瞬态错误处理（不切换凭据）
-            tracing::warn!(
-                "API 请求失败（未知错误，尝试 {}/{}）: {} {}",
-                attempt + 1,
-                max_retries,
-                status,
-                body
-            );
-            Self::emit_attempt(
-                sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                outcome::UNKNOWN, Some(&body), attempt_start,
-            );
-            last_error = Some(anyhow::anyhow!(
-                "{} API 请求失败: {} {}",
-                api_type,
-                status,
-                body
-            ));
-            if attempt + 1 < max_retries {
-                sleep(Self::retry_delay(attempt)).await;
-            }
+            // 走到这里：本凭据的所有端点都因端点级瞬态错误失败。
+            // 立即换下一个凭据，不做任何退避等待。
         }
 
         // 所有重试都失败
@@ -872,32 +821,6 @@ impl KiroProvider {
             .map(|s| s.to_string())
     }
 
-    fn retry_delay(attempt: usize) -> Duration {
-        // 指数退避 + 少量抖动，避免上游抖动时放大故障
-        const BASE_MS: u64 = 200;
-        const MAX_MS: u64 = 2_000;
-        let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
-        let backoff = exp.min(MAX_MS);
-        let jitter_max = (backoff / 4).max(1);
-        let jitter = fastrand::u64(0..=jitter_max);
-        Duration::from_millis(backoff.saturating_add(jitter))
-    }
-
-    /// 429 限流专用退避：比通用退避更长。
-    ///
-    /// 上游 429（SERVICE_REQUEST_RATE_EXCEEDED）是账号级速率配额耗尽，需要更长
-    /// 时间恢复；用通用的 ≤2s 快速退避只会让请求在配额恢复前反复撞墙、持续触顶。
-    /// 这里 base 1s、封顶 8s，给账号配额留出恢复窗口。
-    fn retry_delay_throttle(attempt: usize) -> Duration {
-        const BASE_MS: u64 = 1_000;
-        const MAX_MS: u64 = 8_000;
-        let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
-        let backoff = exp.min(MAX_MS);
-        let jitter_max = (backoff / 4).max(1);
-        let jitter = fastrand::u64(0..=jitter_max);
-        Duration::from_millis(backoff.saturating_add(jitter))
-    }
-
     /// 返回是否刷新成功；类型化刷新 429 原样传播，其他刷新失败交回调用方按认证失败处理。
     fn handle_force_refresh_result(result: anyhow::Result<()>) -> anyhow::Result<bool> {
         match result {
@@ -921,21 +844,6 @@ fn take_rate_limit_error(last_error: &mut Option<anyhow::Error>) -> Option<anyho
     } else {
         None
     }
-}
-
-/// 为账号风控 429 补齐本地冷却时间，并区分上游是否明确要求等待。
-fn account_rate_limit_with_fallback(
-    rate_limit: Option<UpstreamRateLimitError>,
-    cooldown_secs: u64,
-) -> (UpstreamRateLimitError, bool) {
-    let must_wait_for_upstream = rate_limit
-        .as_ref()
-        .is_some_and(|error| !error.should_retry_locally());
-    let error = match rate_limit {
-        Some(error) if error.retry_after().is_some() => error,
-        _ => UpstreamRateLimitError::new(Some(cooldown_secs.to_string())),
-    };
-    (error, must_wait_for_upstream)
 }
 
 #[cfg(test)]
@@ -965,28 +873,6 @@ mod rate_limit_tests {
         let mut last_error = Some(anyhow::anyhow!("所有凭据均已禁用"));
         assert!(take_rate_limit_error(&mut last_error).is_none());
         assert!(last_error.is_some());
-    }
-
-    #[test]
-    fn account_rate_limit_uses_cooldown_when_retry_after_is_missing() {
-        let (error, must_wait) = account_rate_limit_with_fallback(
-            Some(UpstreamRateLimitError::new(None)),
-            300,
-        );
-
-        assert_eq!(error.retry_after(), Some("300"));
-        assert!(!must_wait, "无上游等待值时仍可按账号冷却策略故障转移");
-    }
-
-    #[test]
-    fn account_rate_limit_honors_explicit_upstream_retry_after() {
-        let (error, must_wait) = account_rate_limit_with_fallback(
-            Some(UpstreamRateLimitError::new(Some("90".to_string()))),
-            300,
-        );
-
-        assert_eq!(error.retry_after(), Some("90"));
-        assert!(must_wait, "上游明确要求等待时不得在内部提前重试");
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::model::config::Config;
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
-    AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
+    AddCredentialRequest, AddCredentialResponse,
     AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse,
     BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
     CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse, EnableOverageAllResult,
@@ -29,7 +29,7 @@ use super::types::{
     CredentialsExportResponse,
     LoadBalancingModeResponse, LogGovernanceConfigResponse, PollIdcLoginResponse,
     ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
-    QuotaExceededResult, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
+    QuotaExceededResult, SetLoadBalancingModeRequest,
     SetLogGovernanceConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
     StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
     UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
@@ -527,7 +527,6 @@ impl AdminService {
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
         let snapshot = self.token_manager.snapshot();
-        let default_endpoint = self.token_manager.config().default_endpoint.clone();
 
         // 一次性快照余额缓存，避免 N 次加锁
         let balance_snapshot: HashMap<u64, CachedBalance> = {
@@ -567,7 +566,8 @@ impl AdminService {
                     proxy_url: entry.proxy_url,
                     refresh_failure_count: entry.refresh_failure_count,
                     disabled_reason: entry.disabled_reason,
-                    endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                    // 未声明首选端点时展示 "auto"：请求会按注册顺序尝试全部端点（多端点重试）
+                    endpoint: entry.endpoint.unwrap_or_else(|| "auto".to_string()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
                     balance,
@@ -698,12 +698,6 @@ impl AdminService {
     pub fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
             .reset_and_enable(id)
-            .map_err(|e| self.classify_error(e, id))
-    }
-
-    pub fn clear_throttle(&self, id: u64) -> Result<(), AdminServiceError> {
-        self.token_manager
-            .clear_throttle(id)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -1845,32 +1839,6 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
-    }
-
-    /// 获取账号级风控故障转移配置
-    pub fn get_account_throttle_config(&self) -> AccountThrottleConfigResponse {
-        AccountThrottleConfigResponse {
-            failover: self.token_manager.get_account_throttle_failover(),
-            cooldown_secs: self.token_manager.get_account_throttle_cooldown_secs(),
-        }
-    }
-
-    /// 更新账号级风控故障转移配置
-    pub fn set_account_throttle_config(
-        &self,
-        req: SetAccountThrottleConfigRequest,
-    ) -> Result<AccountThrottleConfigResponse, AdminServiceError> {
-        if req.failover.is_none() && req.cooldown_secs.is_none() {
-            return Err(AdminServiceError::InvalidCredential(
-                "至少提供 failover 或 cooldownSecs 一个字段".to_string(),
-            ));
-        }
-
-        self.token_manager
-            .set_account_throttle_config(req.failover, req.cooldown_secs)
-            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
-
-        Ok(self.get_account_throttle_config())
     }
 
     /// 读取日志治理配置（trace 开关 / trace 保留天数 / usage 保留天数）

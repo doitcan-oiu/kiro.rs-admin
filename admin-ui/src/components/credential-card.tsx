@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState } from "react";
 import { toast } from "sonner";
 import {
   RefreshCw,
@@ -11,7 +11,6 @@ import {
   RotateCcw,
   Zap,
   ZapOff,
-  Clock,
   ScrollText,
   Boxes,
   Wallet,
@@ -48,7 +47,6 @@ import {
   useDeleteCredential,
   useForceRefreshToken,
   useResetSuccessCount,
-  useClearThrottle,
 } from "@/hooks/use-credentials";
 import { setCredentialOverage } from "@/api/credentials";
 import { useQueryClient } from "@tanstack/react-query";
@@ -97,16 +95,6 @@ function formatNumber(n: number): string {
 function formatResetDate(ts: number | null): string {
   if (!ts) return "未知";
   return new Date(ts * 1000).toLocaleString("zh-CN");
-}
-
-/** 把秒数格式化为 `mm:ss` 或 `hh:mm:ss` */
-function formatThrottleCountdown(secs: number): string {
-  const total = Math.max(0, Math.floor(secs));
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
 }
 
 /**
@@ -214,7 +202,6 @@ export function CredentialCard({
   const deleteCredential = useDeleteCredential();
   const forceRefresh = useForceRefreshToken();
   const resetSuccess = useResetSuccessCount();
-  const clearThrottle = useClearThrottle();
   const queryClient = useQueryClient();
 
   // 拖拽排序：手柄触发，整卡随拖动位移
@@ -235,29 +222,6 @@ export function CredentialCard({
     zIndex: isDragging ? 20 : undefined,
   };
 
-  // 后端冷却剩余秒数会在 30s 拉取间隔之间过时，本地用 setInterval 自然递减以让倒计时连续。
-  const [throttleRemaining, setThrottleRemaining] = useState<number>(
-    credential.throttledRemainingSecs ?? 0,
-  );
-  useEffect(() => {
-    setThrottleRemaining(credential.throttledRemainingSecs ?? 0);
-  }, [credential.throttledRemainingSecs]);
-  useEffect(() => {
-    if (throttleRemaining <= 0) return;
-    const t = window.setInterval(() => {
-      setThrottleRemaining((v) => (v > 0 ? v - 1 : 0));
-    }, 1000);
-    return () => window.clearInterval(t);
-  }, [throttleRemaining]);
-  const handleClearThrottle = useCallback(() => {
-    clearThrottle.mutate(credential.id, {
-      onSuccess: (res) => {
-        setThrottleRemaining(0);
-        toast.success(res.message);
-      },
-      onError: (err) => toast.error("解除失败: " + extractErrorMessage(err)),
-    });
-  }, [clearThrottle, credential.id]);
   const [overageBusy, setOverageBusy] = useState(false);
   const handleSetOverage = async (enabled: boolean) => {
     setOverageBusy(true);
@@ -365,17 +329,13 @@ export function CredentialCard({
   const disabledByQuota =
     credential.disabled && credential.disabledReason === "QuotaExceeded";
   const reasonStyle = getDisabledReasonStyle(credential.disabledReason);
-  const isThrottled = !credential.disabled && throttleRemaining > 0;
 
-  // 卡片与列表行共用的状态描边 / 灰化（活跃 · 超额 · 冷却 · 禁用）
+  // 卡片与列表行共用的状态描边 / 灰化（活跃 · 超额 · 禁用）
   const stateClasses = [
     credential.isCurrent ? "ring-2 ring-primary/60 shadow-apple-lg" : "",
     !credential.disabled && isQuotaExceeded ? "ring-1 ring-amber-500/60" : "",
     disabledByQuota
       ? "ring-1 ring-amber-500/70 bg-amber-50/40 dark:bg-amber-500/[0.04]"
-      : "",
-    isThrottled
-      ? "ring-1 ring-orange-500/60 bg-orange-50/40 dark:bg-orange-500/[0.04]"
       : "",
     credential.disabled && !disabledByQuota ? "opacity-70" : "",
   ]
@@ -402,16 +362,6 @@ export function CredentialCard({
       {/* 仍启用但已经达到上限：黄色"已超额"徽章 */}
       {!credential.disabled && isQuotaExceeded && (
         <Badge variant="warning">已超额</Badge>
-      )}
-      {isThrottled && (
-        <Badge
-          variant="warning"
-          className="bg-orange-500/15 text-orange-700 dark:text-orange-300 border-orange-500/30"
-          title="账号级风控冷却中（429 + suspicious activity），到期或手动解除后恢复调度"
-        >
-          <Clock className="mr-1 h-3 w-3" />
-          冷却 {formatThrottleCountdown(throttleRemaining)}
-        </Badge>
       )}
       {credential.authMethod && <Badge variant="secondary">{authLabel}</Badge>}
       {/* 配置元信息合并为单个徽章，减少换行：endpoint · ARN */}
@@ -477,18 +427,6 @@ export function CredentialCard({
           <Boxes />
           查看可用模型
         </DropdownMenuItem>
-        {throttleRemaining > 0 && (
-          <DropdownMenuItem
-            onSelect={(e) => {
-              e.preventDefault();
-              handleClearThrottle();
-            }}
-            disabled={clearThrottle.isPending}
-          >
-            <Clock />
-            解除风控冷却（{formatThrottleCountdown(throttleRemaining)}）
-          </DropdownMenuItem>
-        )}
         {balance?.overageCapable === true &&
           (balance.overageEnabled ? (
             <DropdownMenuItem

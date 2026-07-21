@@ -8,11 +8,12 @@ mod kiro;
 mod model;
 pub mod token;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
-use kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint, RuntimeEndpoint};
+use kiro::endpoint::{
+    AmazonQEndpoint, CliEndpoint, CodeWhispererEndpoint, IdeEndpoint, KiroEndpoint, RuntimeEndpoint,
+};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -113,38 +114,43 @@ async fn main() {
         std::time::Duration::from_secs(12 * 3600),
     );
 
-    // 构建端点注册表
-    let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
-    {
-        let ide = IdeEndpoint::new();
-        endpoints.insert(ide.name().to_string(), Arc::new(ide));
-        let cli = CliEndpoint::new();
-        endpoints.insert(cli.name().to_string(), Arc::new(cli));
-        let runtime = RuntimeEndpoint::new();
-        endpoints.insert(runtime.name().to_string(), Arc::new(runtime));
-    }
+    // 构建端点列表（**有序**）。单次请求会按此顺序对同一凭据依次尝试每个端点
+    // （多端点重试），不再有"默认端点选择"。
+    //
+    // 顺序即重试优先级：
+    // 1. ide（q.amazonaws.com/generateAssistantResponse）
+    // 2. runtime（runtime.kiro.dev）—— 与 ide 是相互独立的限流桶，ide 429 时可切到此处
+    // 3. codewhisperer（codewhisperer.us-east-1.amazonaws.com，非 us-east-1 折叠到 q.{region}）
+    //    + x-amz-target: AmazonCodeWhispererStreamingService.GenerateAssistantResponse
+    //    —— us-east-1 走独有主机，又一个独立限流桶（对齐 demo 的 CodeWhisperer 端点）
+    // 4. amazonq（q.amazonaws.com + x-amz-target: AmazonQDeveloperStreamingService.SendMessage）
+    //    —— 与 ide/runtime 是不同上游服务/限流桶的又一路回退（对齐 demo 的 AmazonQ 端点）
+    // 5. cli（Amazon Q for CLI，x-amz-json 协议）—— 不同协议的回退
+    let endpoints: Vec<Arc<dyn KiroEndpoint>> = vec![
+        Arc::new(IdeEndpoint::new()),
+        Arc::new(RuntimeEndpoint::new()),
+        Arc::new(CodeWhispererEndpoint::new()),
+        Arc::new(AmazonQEndpoint::new()),
+        Arc::new(CliEndpoint::new()),
+    ];
 
-    // 校验默认端点存在
-    if !endpoints.contains_key(&config.default_endpoint) {
-        tracing::error!("默认端点 \"{}\" 未注册", config.default_endpoint);
-        std::process::exit(1);
-    }
+    let endpoint_names: Vec<String> = endpoints.iter().map(|e| e.name().to_string()).collect();
 
-    // 校验所有凭据声明的端点都已注册
+    // 凭据可选地声明一个"首选端点"（会被排到重试序列最前），未声明则按上面的顺序
+    // 尝试全部端点。这里仅校验声明的端点名合法。
     for cred in &credentials_list {
-        let name = cred.endpoint.as_deref().unwrap_or(&config.default_endpoint);
-        if !endpoints.contains_key(name) {
-            tracing::error!(
-                "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
-                cred.id,
-                name,
-                endpoints.keys().collect::<Vec<_>>()
-            );
-            std::process::exit(1);
+        if let Some(name) = cred.endpoint.as_deref() {
+            if !endpoint_names.iter().any(|n| n == name) {
+                tracing::error!(
+                    "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
+                    cred.id,
+                    name,
+                    endpoint_names
+                );
+                std::process::exit(1);
+            }
         }
     }
-
-    let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
 
     // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new(
@@ -163,7 +169,6 @@ async fn main() {
         token_manager.clone(),
         proxy_config.clone(),
         endpoints,
-        config.default_endpoint.clone(),
     );
 
     // 初始化 count_tokens 配置
@@ -372,8 +377,7 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
             "apiKey": api_key,
             "adminApiKey": admin_api_key,
             "region": "us-east-1",
-            "tlsBackend": "rustls",
-            "defaultEndpoint": "ide"
+            "tlsBackend": "rustls"
         });
         match serde_json::to_string_pretty(&default)
             .map_err(anyhow::Error::from)
