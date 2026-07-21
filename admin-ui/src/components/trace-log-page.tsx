@@ -10,6 +10,7 @@ import {
   CheckCircle2,
   Unplug,
   Settings2,
+  Trash2,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -35,7 +36,8 @@ import {
   SelectContent as UiSelectContent,
   SelectItem as UiSelectItem,
 } from '@/components/ui/select'
-import { useTraces } from '@/hooks/use-traces'
+import { useTraces, useClearTraces } from '@/hooks/use-traces'
+import { useConfirm } from '@/components/ui/confirm-dialog'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import {
@@ -534,6 +536,27 @@ export function TraceLogPage() {
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
 
+  const confirm = useConfirm()
+  const clearTraces = useClearTraces()
+  const handleClear = async () => {
+    if (
+      !(await confirm({
+        title: '清空请求日志',
+        description: '将删除全部请求链路记录，此操作无法撤销。确定继续？',
+        confirmText: '清空',
+        destructive: true,
+      }))
+    )
+      return
+    try {
+      await clearTraces.mutateAsync()
+      setPage(0)
+      toast.success('已清空所有请求日志')
+    } catch (err) {
+      toast.error('清空失败：' + extractErrorMessage(err))
+    }
+  }
+
   return (
     <div className="space-y-5">
       {/* 筛选栏 */}
@@ -566,6 +589,16 @@ export function TraceLogPage() {
           <Button size="sm" variant="outline" onClick={() => refetch()} disabled={isFetching}>
             <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
             刷新
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="text-destructive hover:text-destructive"
+            onClick={handleClear}
+            disabled={clearTraces.isPending || total === 0}
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            清空
           </Button>
         </div>
       </div>

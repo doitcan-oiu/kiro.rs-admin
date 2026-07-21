@@ -566,6 +566,19 @@ impl TraceStore {
         }
     }
 
+    /// 清空所有 trace 记录（traces + attempts）。返回删除的 trace 条数；失败返回 Err。
+    pub fn clear_all(&self) -> rusqlite::Result<usize> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM trace_attempts", [])?;
+        let n = tx.execute("DELETE FROM traces", [])?;
+        tx.commit()?;
+        if n > 0 {
+            tracing::info!("已清空全部 {} 条 trace 记录", n);
+        }
+        Ok(n)
+    }
+
     /// 删除指定凭据关联的 trace 记录，避免删除账号后新账号复用同一 credential_id
     /// 时继承旧账号的失败统计。
     pub fn delete_for_credential(&self, credential_id: u64) {

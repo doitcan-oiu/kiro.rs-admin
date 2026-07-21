@@ -1,5 +1,10 @@
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { getTraces, getFailureStats } from '@/api/traces'
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
+import { getTraces, getFailureStats, clearTraces } from '@/api/traces'
 import type { TraceQuery } from '@/types/api'
 
 /**
@@ -17,6 +22,15 @@ export function useTraces(query: TraceQuery, enabled = true) {
     staleTime: 10_000,
     placeholderData: keepPreviousData,
     refetchOnWindowFocus: false,
+  })
+}
+
+/** 一键清空所有请求日志 */
+export function useClearTraces() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: clearTraces,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['traces'] }),
   })
 }
 

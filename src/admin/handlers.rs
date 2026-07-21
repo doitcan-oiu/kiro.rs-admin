@@ -1322,6 +1322,23 @@ pub async fn list_traces(
     Json(serde_json::json!({ "records": enriched, "total": total }))
 }
 
+/// DELETE /api/admin/traces
+/// 一键清空所有请求链路记录（traces + attempts）。
+pub async fn clear_traces(State(state): State<AdminState>) -> impl IntoResponse {
+    use axum::http::StatusCode;
+    match state.trace_store.clear_all() {
+        Ok(n) => Json(SuccessResponse::new(format!("已清空 {} 条请求日志", n))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(super::types::AdminErrorResponse::internal_error(format!(
+                "清空请求日志失败: {}",
+                e
+            ))),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /api/admin/traces/failure-stats
 /// 按凭据聚合失败次数（鉴权 / 账号风控 / 其他三类），用于卡片分色展示。
 /// 返回 { "<credentialId>": { auth, throttle, other }, ... }
