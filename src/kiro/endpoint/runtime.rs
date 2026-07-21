@@ -1,24 +1,30 @@
-//! Kiro IDE 端点
+//! Kiro Runtime 端点
 //!
-//! 对应 Kiro IDE 客户端目前使用的 AWS CodeWhisperer 端点：
-//! - API: `https://q.{api_region}.amazonaws.com/generateAssistantResponse`
-//! - MCP: `https://q.{api_region}.amazonaws.com/mcp`
+//! 对应 Kiro IDE 客户端较新的 `runtime.kiro.dev` 推理链路：
+//! - API: `https://runtime.{api_region}.kiro.dev/generateAssistantResponse`
+//! - MCP: `https://runtime.{api_region}.kiro.dev/mcp`
 //!
-//! 请求头使用 aws-sdk-js User-Agent 标识。请求体会在根对象上注入 `profileArn`。
+//! 请求头、请求体加工（注入 profileArn）与 [`super::ide::IdeEndpoint`]
+//! **完全一致**，唯一差别是域名从 `q.{region}.amazonaws.com` 换成
+//! `runtime.{region}.kiro.dev`。
+//!
+//! 关键价值：实测 `runtime.kiro.dev` 与 `q.amazonaws.com` 是**两个独立的限流桶**——
+//! 一个 429 时另一个仍可 200。
 
 use reqwest::RequestBuilder;
 use uuid::Uuid;
 
+use super::ide::inject_profile_arn;
 use super::{KiroEndpoint, RequestContext};
 use crate::kiro::kiro_version;
 
-/// Kiro IDE 端点名称
-pub const IDE_ENDPOINT_NAME: &str = "ide";
+/// Kiro Runtime 端点名称
+pub const RUNTIME_ENDPOINT_NAME: &str = "runtime";
 
-/// Kiro IDE 端点
-pub struct IdeEndpoint;
+/// Kiro Runtime 端点
+pub struct RuntimeEndpoint;
 
-impl IdeEndpoint {
+impl RuntimeEndpoint {
     pub fn new() -> Self {
         Self
     }
@@ -28,7 +34,7 @@ impl IdeEndpoint {
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("q.{}.amazonaws.com", self.api_region(ctx))
+        format!("runtime.{}.kiro.dev", self.api_region(ctx))
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
@@ -50,26 +56,26 @@ impl IdeEndpoint {
     }
 }
 
-impl Default for IdeEndpoint {
+impl Default for RuntimeEndpoint {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl KiroEndpoint for IdeEndpoint {
+impl KiroEndpoint for RuntimeEndpoint {
     fn name(&self) -> &'static str {
-        IDE_ENDPOINT_NAME
+        RUNTIME_ENDPOINT_NAME
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
         format!(
-            "https://q.{}.amazonaws.com/generateAssistantResponse",
+            "https://runtime.{}.kiro.dev/generateAssistantResponse",
             self.api_region(ctx)
         )
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://q.{}.amazonaws.com/mcp", self.api_region(ctx))
+        format!("https://runtime.{}.kiro.dev/mcp", self.api_region(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
@@ -112,62 +118,38 @@ impl KiroEndpoint for IdeEndpoint {
     }
 }
 
-/// 将 profile_arn 注入到请求体 JSON 根对象
-///
-/// runtime 端点（`runtime.rs`）与 ide 端点的请求体加工完全一致，直接复用本函数。
-pub(crate) fn inject_profile_arn(request_body: &str, profile_arn: Option<&str>) -> String {
-    if let Some(arn) = profile_arn {
-        if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
-            json["profileArn"] = serde_json::Value::String(arn.to_string());
-            if let Ok(body) = serde_json::to_string(&json) {
-                return body;
-            }
-        }
-    }
-    request_body.to_string()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::inject_profile_arn;
-    use serde_json::Value;
+    use super::*;
+    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::model::config::Config;
+
+    fn ctx<'a>(
+        creds: &'a KiroCredentials,
+        config: &'a Config,
+        machine_id: &'a str,
+    ) -> RequestContext<'a> {
+        RequestContext {
+            credentials: creds,
+            token: "tok",
+            machine_id,
+            config,
+        }
+    }
 
     #[test]
-    fn test_inject_profile_arn_with_some() {
-        let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
-        let arn = Some("arn:aws:codewhisperer:us-east-1:123:profile/ABC".to_string());
-        let result = inject_profile_arn(body, arn.as_deref());
-        let json: Value = serde_json::from_str(&result).unwrap();
+    fn test_runtime_urls_use_kiro_dev_domain() {
+        let endpoint = RuntimeEndpoint::new();
+        let mut config = Config::default();
+        config.api_region = Some("us-east-1".to_string());
+        let creds = KiroCredentials::default();
+        let rctx = ctx(&creds, &config, "machine");
+
         assert_eq!(
-            json["profileArn"],
-            "arn:aws:codewhisperer:us-east-1:123:profile/ABC"
+            endpoint.api_url(&rctx),
+            "https://runtime.us-east-1.kiro.dev/generateAssistantResponse"
         );
-        assert_eq!(json["conversationState"]["conversationId"], "c1");
-    }
-
-    #[test]
-    fn test_inject_profile_arn_with_none() {
-        let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
-        let result = inject_profile_arn(body, None);
-        let json: Value = serde_json::from_str(&result).unwrap();
-        assert!(json.get("profileArn").is_none());
-        assert_eq!(json["conversationState"]["conversationId"], "c1");
-    }
-
-    #[test]
-    fn test_inject_profile_arn_overwrites_existing() {
-        let body = r#"{"conversationState":{},"profileArn":"old-arn"}"#;
-        let arn = Some("new-arn".to_string());
-        let result = inject_profile_arn(body, arn.as_deref());
-        let json: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(json["profileArn"], "new-arn");
-    }
-
-    #[test]
-    fn test_inject_profile_arn_invalid_json() {
-        let body = "not-valid-json";
-        let arn = Some("arn:test".to_string());
-        let result = inject_profile_arn(body, arn.as_deref());
-        assert_eq!(result, "not-valid-json");
+        assert_eq!(endpoint.mcp_url(&rctx), "https://runtime.us-east-1.kiro.dev/mcp");
+        assert_eq!(endpoint.host(&rctx), "runtime.us-east-1.kiro.dev");
     }
 }

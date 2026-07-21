@@ -31,3 +31,6 @@
 .ace-tool/
 .codegraph/
 .claude/
+
+# 演示项目
+/demo/

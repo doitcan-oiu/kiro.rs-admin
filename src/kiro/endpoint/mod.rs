@@ -13,9 +13,11 @@ use crate::model::config::Config;
 
 pub mod cli;
 pub mod ide;
+pub mod runtime;
 
 pub use cli::CliEndpoint;
 pub use ide::IdeEndpoint;
+pub use runtime::RuntimeEndpoint;
 
 /// Kiro 端点
 ///
